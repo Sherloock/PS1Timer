@@ -1,0 +1,27 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  pester:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PowerShell 7.4
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($PSVersionTable.PSVersion -lt [version]'7.4.0') {
+            Write-Host "Current pwsh: $($PSVersionTable.PSVersion)"
+          }
+
+      - name: Run Pester tests
+        shell: pwsh
+        run: |
+          Set-Location $env:GITHUB_WORKSPACE
+          ./Run-Tests.ps1

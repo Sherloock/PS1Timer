@@ -1,0 +1,26 @@
+name: Bug report
+description: Report a problem with PS1Timer
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Steps to reproduce and expected vs actual behavior.
+    validations:
+      required: true
+  - type: input
+    id: pwsh-version
+    attributes:
+      label: PowerShell version
+      placeholder: "7.4.x"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Windows version
+      placeholder: "Windows 11 23H2"
+    validations:
+      required: true

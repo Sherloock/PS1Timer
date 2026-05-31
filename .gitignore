@@ -1,0 +1,7 @@
+config.ps1
+TestResults/
+*.log
+.vscode/
+*.user
+Thumbs.db
+.DS_Store
