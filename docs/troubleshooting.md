@@ -55,6 +55,24 @@ Get-Command t
 
 Add `loader.ps1` to `$PROFILE` for persistence.
 
+## Errors before `tpre` menu / confirm `t` is PS1Timer
+
+**Red errors before the preset picker** often come from PS1Toolz failing to parse a script during `Load-Toolkit` (check the first `ParserError` line). Fix that file, then open a new terminal.
+
+**Many errors only when opening `tpre`** were caused by `[ordered]@{}` presets not supporting `.ContainsKey` — fixed in current `Timer.ps1`; reload the module.
+
+**Verify source** (after first `t` or `Load-PS1Timer`):
+
+```powershell
+Show-TimerCommandSource   # if defined in profile.local.ps1
+# or:
+Get-Command t, Timer, tpre | Format-Table Name, CommandType, Source, @{ n='Module'; e={ $_.ModuleName } }
+```
+
+`Module` should be **PS1Timer**. `Source` should point under your `PS1Timer` folder, not `PS1Toolz`.
+
+**Lazy load:** dotfile `profile.local.ps1` can defer PS1Timer until the first `t` / `tpre`. Set `$env:PS1TIMER_EAGER = '1'` before profile runs to load at startup instead.
+
 ## Tests fail locally
 
 ```powershell

@@ -1403,17 +1403,18 @@ function Invoke-RemoveSingleTimer {
 # Timer module - Sequence timer parsing and handling
 
 # Timer presets - built-ins from config/presets.ps1, optional user overrides in config.ps1
-if (-not $script:BuiltInTimerPresets) {
+if (-not $script:BuiltInTimerPresets -or $script:BuiltInTimerPresets.Count -eq 0) {
     throw 'PS1Timer: BuiltInTimerPresets not initialized. Load config/presets.ps1 before Timer.ps1.'
 }
-if ($global:Config -and $global:Config.TimerPresets) {
-    $script:TimerPresets = @{} + $script:BuiltInTimerPresets
-    foreach ($key in $global:Config.TimerPresets.Keys) {
-        $script:TimerPresets[$key] = $global:Config.TimerPresets[$key]
-    }
+
+$script:TimerPresets = @{}
+foreach ($presetKey in $script:BuiltInTimerPresets.Keys) {
+    $script:TimerPresets[$presetKey] = $script:BuiltInTimerPresets[$presetKey]
 }
-else {
-    $script:TimerPresets = $script:BuiltInTimerPresets
+if ($global:Config -and $global:Config.TimerPresets) {
+    foreach ($presetKey in $global:Config.TimerPresets.Keys) {
+        $script:TimerPresets[$presetKey] = $global:Config.TimerPresets[$presetKey]
+    }
 }
 
 function Test-TimerSequence {
@@ -1424,7 +1425,7 @@ function Test-TimerSequence {
     param([string]$Pattern)
 
     # Check for preset name first
-    if ($script:TimerPresets.ContainsKey($Pattern)) {
+    if ($script:TimerPresets.Keys -contains $Pattern) {
         return $true
     }
 
@@ -1444,7 +1445,7 @@ function ConvertFrom-TimerSequence {
     param([string]$Pattern)
 
     # Resolve preset if applicable
-    if ($script:TimerPresets.ContainsKey($Pattern)) {
+    if (($script:TimerPresets.Keys -contains $Pattern)) {
         $Pattern = $script:TimerPresets[$Pattern].Pattern
     }
 
@@ -2136,7 +2137,7 @@ function Start-SequenceTimer {
     )
 
     $originalPattern = $Pattern
-    if ($script:TimerPresets.ContainsKey($Pattern)) {
+    if (($script:TimerPresets.Keys -contains $Pattern)) {
         $Pattern = $script:TimerPresets[$Pattern].Pattern
     }
 

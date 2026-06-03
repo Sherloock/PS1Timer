@@ -241,7 +241,7 @@ Describe "TimerPresets" {
 
     It "contains all expected preset keys" {
         foreach ($name in $expectedPresets) {
-            $script:TimerPresets.ContainsKey($name) | Should -BeTrue
+            ($script:TimerPresets.Keys -contains $name) | Should -BeTrue
         }
     }
 

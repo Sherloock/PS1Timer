@@ -2,9 +2,9 @@
     RootModule           = 'PS1Timer.psm1'
     ModuleVersion        = '1.0.0'
     GUID                 = 'a3f8c2e1-4b9d-4a7f-9e6c-1d2b3c4d5e6f'
-    Author               = 'Balint'
+    Author               = 'Deak, Balint'
     CompanyName          = 'Personal'
-    Copyright            = '(c) Balint. MIT License.'
+    Copyright            = '(c) Deak, Balint. MIT License.'
     Description          = 'PowerShell 7 timer and Pomodoro for Windows using scheduled tasks, sequences, and presets.'
     PowerShellVersion    = '7.4'
     CompatiblePSEditions = @('Core')
