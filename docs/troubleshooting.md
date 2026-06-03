@@ -83,7 +83,7 @@ Requires Pester 5.x — `Run-Tests.ps1` installs it if missing.
 
 ## Wrong preset count or missing preset
 
-Built-ins come from `config/presets.ps1`. After editing, reload:
+Built-ins come from `src/BuiltInPresets.ps1`. After editing, reload:
 
 ```powershell
 Import-Module .\PS1Timer.psd1 -Force

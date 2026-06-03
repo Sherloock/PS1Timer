@@ -62,8 +62,8 @@ Legacy tasks may use `PSTimer_<id>` only; sync logic handles both via the `TaskN
 
 ## Module load order
 
-1. Optional `config.ps1` → `$global:Config`
-2. `config/presets.ps1` → `$script:BuiltInTimerPresets`
+1. `config.ps1` if present, else `config.example.ps1` → `$global:Config`
+2. `src/BuiltInPresets.ps1` → `$script:BuiltInTimerPresets`
 3. `src/TimerHelpers.ps1` → time parsing, menus, help
 4. `src/Timer.ps1` → timer logic, merges presets, defines commands
 

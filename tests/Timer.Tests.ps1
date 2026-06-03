@@ -4,7 +4,11 @@
 BeforeAll {
     $ModuleRoot = Split-Path -Parent $PSScriptRoot
     if (-not $global:Config) { $global:Config = @{} }
-    . "$ModuleRoot\config\presets.ps1"
+    $exampleConfig = Join-Path $ModuleRoot 'config.example.ps1'
+    if (Test-Path -LiteralPath $exampleConfig) {
+        . $exampleConfig
+    }
+    . "$ModuleRoot\src\BuiltInPresets.ps1"
     . "$ModuleRoot\src\TimerHelpers.ps1"
     . "$ModuleRoot\src\Timer.ps1"
 

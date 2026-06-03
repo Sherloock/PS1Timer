@@ -1,11 +1,11 @@
 # PS1Timer
 
-PowerShell 7 timer and Pomodoro for **Windows**. Countdowns run as **Windows Scheduled Tasks**, so they keep firing after you close the terminal.
+PowerShell 7 timers and Pomodoro for **Windows**. Countdowns run as **Windows Scheduled Tasks**, so they keep firing after you close the terminal.
 
 ## Requirements
 
 - **PowerShell 7.4+** (`pwsh`)
-- **Windows 10/11** (uses Scheduled Task API; not supported on Linux/macOS)
+- **Windows 10/11** (Scheduled Task API; not supported on Linux/macOS)
 
 ## Install
 
@@ -13,6 +13,13 @@ PowerShell 7 timer and Pomodoro for **Windows**. Countdowns run as **Windows Sch
 git clone https://github.com/Sherloock/PS1Timer.git
 Set-Location PS1Timer
 Import-Module .\PS1Timer.psd1 -Force
+```
+
+Verify:
+
+```powershell
+Get-Command t, tl, tw
+t   # shows help
 ```
 
 Optional — load on every shell session:
@@ -25,17 +32,29 @@ Optional — load on every shell session:
 ## Quick start
 
 ```powershell
-t 25m                    # 25-minute timer
-t 1h30m "Deep work"      # custom message
-t -Repeat 3 10m "Sets"   # repeat 3 times
-t pomodoro               # run a preset sequence
-tpre                     # interactive preset picker
-tl                       # list active timers
-tl -w                    # live-updating list
-tw 1                     # watch timer #1
-tp 1                     # pause timer #1
-tr 1                     # resume
-td all                   # remove all timers
+# Simple countdown
+t 25m
+t 30m "Stretch break"
+t 1h30m "Deep work" 2          # repeat twice
+
+# Presets (19 built-in — no config setup needed)
+t pomodoro
+t tabata
+tpre                           # interactive picker
+
+# Custom sequence
+t "(25m work, 5m rest)x4, 20m 'long break'"
+
+# Manage running timers
+tl                             # list active timers
+tw 1                           # progress view for timer #1
+tp 1; tr 1                     # pause / resume
+td done                        # remove completed timers
+
+# Notifications
+t 25m -Notify toast
+t 10m -Notify sound
+t 5m -Notify silent
 ```
 
 ## Commands
@@ -58,15 +77,16 @@ Full reference: [docs/commands.md](docs/commands.md)
 
 ```powershell
 t pomodoro-short
-t tabata
+t 52-17
 tpre
 ```
 
-See [docs/presets.md](docs/presets.md) for the full table and how to add custom presets.
+Full table: [docs/presets.md](docs/presets.md)
 
 ## Sequence syntax
 
 ```powershell
+t "25m work, 5m rest"
 t "(25m work, 5m rest)x4, 20m 'long break'"
 t "((25m work, 5m rest)x4, 20m break)x2"
 ```
@@ -75,11 +95,44 @@ Grammar and examples: [docs/sequence-syntax.md](docs/sequence-syntax.md)
 
 ## Configuration
 
+Works out of the box — no copy step required.
+
+| File | Role |
+|------|------|
+| [`config.example.ps1`](config.example.ps1) | Default settings — **loaded automatically** when `config.ps1` is absent |
+| `config.ps1` | Optional personal settings (gitignored) — **replaces** the example when present |
+| [`src/BuiltInPresets.ps1`](src/BuiltInPresets.ps1) | Shipped preset definitions — edit only when contributing |
+
+To customize notifications or add/override presets:
+
 ```powershell
 Copy-Item config.example.ps1 config.ps1
+# Edit config.ps1 — set TimerDefaults.Notify, add TimerPresets, etc.
 ```
 
-Set default notification mode (`popup`, `toast`, `sound`, `silent`) and override presets. Details: [docs/notifications.md](docs/notifications.md)
+Then reload the module:
+
+```powershell
+Import-Module .\PS1Timer.psd1 -Force
+```
+
+Details: [docs/notifications.md](docs/notifications.md) · [docs/presets.md](docs/presets.md)
+
+## Project layout
+
+```
+PS1Timer/
+├── PS1Timer.psd1          # Module manifest
+├── PS1Timer.psm1          # Loader (config + sources)
+├── loader.ps1             # Profile entry point
+├── config.example.ps1     # Default config (auto-loaded)
+├── src/
+│   ├── BuiltInPresets.ps1 # 19 built-in presets
+│   ├── Timer.ps1          # Timer commands
+│   └── TimerHelpers.ps1   # Parsing, UI helpers
+├── docs/                  # Full documentation
+└── tests/                 # Pester tests
+```
 
 ## Documentation
 
@@ -99,6 +152,8 @@ Set default notification mode (`popup`, `toast`, `sound`, `silent`) and override
 .\Run-Tests.ps1
 .\Run-Tests.ps1 -Detailed
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

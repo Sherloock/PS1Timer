@@ -2,6 +2,14 @@
 
 All notable changes to PS1Timer are documented here.
 
+## [Unreleased]
+
+### Changed
+
+- `config.example.ps1` loads automatically when `config.ps1` is absent (zero-config install)
+- Built-in presets moved from `config/presets.ps1` to `src/BuiltInPresets.ps1`
+- README and docs clarify configuration model (example vs personal `config.ps1`)
+
 ## [1.0.0] - 2026-05-31
 
 ### Added

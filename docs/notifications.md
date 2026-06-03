@@ -13,7 +13,9 @@ When a timer phase completes, PS1Timer notifies you using the configured mode.
 
 ## Default configuration
 
-In `config.ps1` (copy from `config.example.ps1`):
+Defaults come from `config.example.ps1`, which loads automatically when `config.ps1` is absent.
+
+To customize, copy to `config.ps1` and edit:
 
 ```powershell
 $global:Config = @{
@@ -23,6 +25,8 @@ $global:Config = @{
     }
 }
 ```
+
+Reload: `Import-Module .\PS1Timer.psd1 -Force`
 
 ## Per-timer override
 

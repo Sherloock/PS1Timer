@@ -1402,9 +1402,9 @@ function Invoke-RemoveSingleTimer {
 # region Timer-Sequence.ps1
 # Timer module - Sequence timer parsing and handling
 
-# Timer presets - built-ins from config/presets.ps1, optional user overrides in config.ps1
+# Timer presets - built-ins from src/BuiltInPresets.ps1, optional user overrides in config.ps1
 if (-not $script:BuiltInTimerPresets -or $script:BuiltInTimerPresets.Count -eq 0) {
-    throw 'PS1Timer: BuiltInTimerPresets not initialized. Load config/presets.ps1 before Timer.ps1.'
+    throw 'PS1Timer: BuiltInTimerPresets not initialized. Load src/BuiltInPresets.ps1 before Timer.ps1.'
 }
 
 $script:TimerPresets = @{}
@@ -2011,7 +2011,7 @@ function Show-TimerHelp {
                 @{ Type='raw'; Text='  sound  Sound only, no visual notification' }
                 @{ Type='raw'; Text='  silent No notification at all' }
                 @{ Type='raw'; Text='' }
-                @{ Type='raw'; Text='  Default: Set in config.ps1 -> TimerDefaults.Notify' }
+                @{ Type='raw'; Text='  Default: config.example.ps1 or config.ps1 -> TimerDefaults.Notify' }
             )
         }
     )
@@ -2030,7 +2030,7 @@ function Timer {
         Number of times to repeat the timer (e.g., -r 3 repeats 3 times total).
     .PARAMETER Notify
         Notification type: popup (default), toast, sound, silent.
-        Override default in config.ps1 TimerDefaults.Notify.
+        Override default in config.ps1 / config.example.ps1 TimerDefaults.Notify.
     .EXAMPLE
         t 25m
         t 30m Water

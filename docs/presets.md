@@ -1,6 +1,6 @@
 # Presets
 
-Built-in presets live in [`config/presets.ps1`](../config/presets.ps1). User overrides merge on top via `config.ps1`.
+Built-in presets live in [`src/BuiltInPresets.ps1`](../src/BuiltInPresets.ps1). User overrides merge on top via `config.ps1` (or defaults from `config.example.ps1`).
 
 ## Usage
 
@@ -40,6 +40,10 @@ Copy `config.example.ps1` to `config.ps1` and add under `TimerPresets`:
 
 ```powershell
 $global:Config = @{
+    TimerDefaults = @{
+        Notify    = 'popup'
+        SoundFile = $null
+    }
     TimerPresets = @{
         'my-focus' = @{
             Pattern     = '(40m focus, 10m break)x3'
@@ -53,4 +57,4 @@ User presets **merge** with built-ins; same key replaces the built-in entry.
 
 ## Edit built-ins for everyone
 
-To change defaults for all users of your fork, edit `config/presets.ps1` directly and run tests.
+To change defaults for all users of your fork, edit `src/BuiltInPresets.ps1` directly and run tests.

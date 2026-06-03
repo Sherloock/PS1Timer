@@ -3,7 +3,11 @@
 BeforeAll {
     $ModuleRoot = Split-Path -Parent $PSScriptRoot
     if (-not $global:Config) { $global:Config = @{} }
-    . "$ModuleRoot\config\presets.ps1"
+    $exampleConfig = Join-Path $ModuleRoot 'config.example.ps1'
+    if (Test-Path -LiteralPath $exampleConfig) {
+        . $exampleConfig
+    }
+    . "$ModuleRoot\src\BuiltInPresets.ps1"
     . "$ModuleRoot\src\TimerHelpers.ps1"
     . "$ModuleRoot\src\Timer.ps1"
 
@@ -249,6 +253,21 @@ Describe "TimerPresets" {
         foreach ($name in $expectedPresets) {
             $script:TimerPresets[$name].Pattern | Should -Not -BeNullOrEmpty
             $script:TimerPresets[$name].Description | Should -Not -BeNullOrEmpty
+        }
+    }
+}
+
+Describe "Module configuration loading" {
+    It "loads TimerDefaults from config.example.ps1" {
+        $saved = $global:Config
+        try {
+            $global:Config = @{}
+            . (Join-Path $ModuleRoot 'config.example.ps1')
+            $cfg = Get-TimerNotificationConfig
+            $cfg.Notify | Should -Be 'popup'
+        }
+        finally {
+            $global:Config = $saved
         }
     }
 }

@@ -8,6 +8,12 @@ Thanks for helping improve PS1Timer.
 2. Load the module: `Import-Module .\PS1Timer.psd1 -Force`
 3. Run tests: `.\Run-Tests.ps1`
 
+## Built-in presets
+
+Edit [`src/BuiltInPresets.ps1`](src/BuiltInPresets.ps1) to add or change shipped presets. Run `.\Run-Tests.ps1` — the suite expects 19 built-in keys.
+
+User-facing defaults live in [`config.example.ps1`](config.example.ps1). Personal overrides belong in `config.ps1` (gitignored).
+
 ## Pull requests
 
 - Keep changes focused; match existing PowerShell style.
