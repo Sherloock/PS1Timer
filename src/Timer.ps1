@@ -12,31 +12,61 @@ $script:TimerDataCacheTime = [DateTime]::MinValue
 $script:PS1TimerPwsh = (Get-Command pwsh.exe -ErrorAction Stop).Source
 # Tests set $true so Register-ScheduledTask mocks apply in-process
 $script:TimerForceSyncRegister = $false
+# Cached PSTimer_* scheduled task names (avoids repeated COM/CIM enumeration)
+$script:TimerTaskNameCache = $null
+$script:TimerTaskNameCacheTime = [DateTime]::MinValue
+$script:TimerTaskNameCacheTtlSeconds = 2
 
 function Get-TimerData {
     <#
     .SYNOPSIS
-        Loads timer metadata from JSON file.
+        Loads timer metadata from JSON file (uses file-change cache).
     #>
-    if (Test-Path -LiteralPath $script:TimerDataFile) {
-        try {
-            $content = Get-Content -LiteralPath $script:TimerDataFile -Raw -ErrorAction Stop
-            if ($content) {
-                $data = $content | ConvertFrom-Json
-                # Handle nested value structures from ConvertTo-Json
-                $result = @()
-                foreach ($item in $data) {
-                    if ($item.PSObject.Properties.Name -contains 'Id') {
-                        $result += $item
-                    }
-                }
-                return $result
-            }
+    param([switch]$Force)
+
+    $data = (Get-TimerDataIfChanged -Force:$Force).Data
+    if ($null -eq $data) {
+        return @()
+    }
+    if ($data -isnot [System.Array]) {
+        return @($data)
+    }
+    return [object[]]$data
+}
+
+function Read-TimerDataFromFile {
+    <#
+    .SYNOPSIS
+        Reads and parses ps-timers.json from disk.
+    #>
+    if (-not (Test-Path -LiteralPath $script:TimerDataFile)) {
+        return @()
+    }
+
+    try {
+        $content = [System.IO.File]::ReadAllText($script:TimerDataFile)
+        if ([string]::IsNullOrWhiteSpace($content)) {
+            return @()
         }
-        catch {
-            # File corrupted or empty, return empty array
+
+        $data = $content | ConvertFrom-Json
+        if ($null -eq $data) {
+            return @()
+        }
+        if ($data -is [System.Array]) {
+            if ($data.Count -eq 0) {
+                return @()
+            }
+            return @($data)
+        }
+        if ($null -ne $data.PSObject.Properties['Id']) {
+            return @($data)
         }
     }
+    catch {
+        # File corrupted or empty
+    }
+
     return @()
 }
 
@@ -61,8 +91,10 @@ function Get-TimerDataIfChanged {
     }
 
     $fileInfo = Get-Item -LiteralPath $script:TimerDataFile -ErrorAction SilentlyContinue
-    if (-not $fileInfo) {
-        return @{ Data = @(); Changed = $false }
+    if (-not $fileInfo -or $fileInfo.Length -eq 0) {
+        $script:TimerDataCache = @()
+        $script:TimerDataCacheTime = if ($fileInfo) { $fileInfo.LastWriteTime } else { [DateTime]::MinValue }
+        return @{ Data = @(); Changed = $true }
     }
 
     $lastWrite = $fileInfo.LastWriteTime
@@ -73,7 +105,7 @@ function Get-TimerDataIfChanged {
     }
 
     # File changed or no cache - read fresh data
-    $script:TimerDataCache = @(Get-TimerData)
+    $script:TimerDataCache = @(Read-TimerDataFromFile)
     $script:TimerDataCacheTime = $lastWrite
 
     return @{ Data = $script:TimerDataCache; Changed = $true }
@@ -87,16 +119,18 @@ function Save-TimerData {
     param([array]$Timers)
 
     if ($Timers.Count -eq 0) {
-        if (Test-Path -LiteralPath $script:TimerDataFile) {
-            Remove-Item -LiteralPath $script:TimerDataFile -Force
-        }
+        $utf8Bom = New-Object System.Text.UTF8Encoding $true
+        [System.IO.File]::WriteAllText($script:TimerDataFile, '[]', $utf8Bom)
+        $script:TimerDataCache = @()
+        $fileInfo = Get-Item -LiteralPath $script:TimerDataFile -ErrorAction SilentlyContinue
+        $script:TimerDataCacheTime = if ($fileInfo) { $fileInfo.LastWriteTime } else { Get-Date }
         return
     }
 
     # Flatten and clean the array before saving
-    $clean = @()
+    $clean = [System.Collections.Generic.List[object]]::new()
     foreach ($t in $Timers) {
-        if ($t.PSObject.Properties.Name -contains 'Id') {
+        if ($null -ne $t -and $null -ne $t.PSObject.Properties['Id']) {
             $obj = [PSCustomObject]@{
                 Id               = $t.Id
                 Duration         = $t.Duration
@@ -127,13 +161,15 @@ function Save-TimerData {
                 $obj | Add-Member -NotePropertyName 'TotalSeconds' -NotePropertyValue ([int]$t.TotalSeconds)
             }
 
-            $clean += $obj
+            $clean.Add($obj)
         }
     }
 
     $utf8Bom = New-Object System.Text.UTF8Encoding $true
-    [System.IO.File]::WriteAllText($script:TimerDataFile, (ConvertTo-Json -InputObject $clean -Depth 10), $utf8Bom)
-    $script:TimerDataCacheTime = [DateTime]::MinValue
+    [System.IO.File]::WriteAllText($script:TimerDataFile, (ConvertTo-Json -InputObject $clean -Depth 10 -Compress), $utf8Bom)
+    $script:TimerDataCache = @($clean)
+    $fileInfo = Get-Item -LiteralPath $script:TimerDataFile -ErrorAction SilentlyContinue
+    $script:TimerDataCacheTime = if ($fileInfo) { $fileInfo.LastWriteTime } else { Get-Date }
 }
 
 function Sync-TimerData {
@@ -146,13 +182,15 @@ function Sync-TimerData {
     #>
     $timers = @(Get-TimerData)
     $changed = $false
+    $now = Get-Date
+    $taskNames = $null
 
     foreach ($timer in $timers) {
         if ($timer.State -ne 'Running') { continue }
 
         try {
             $endTime = [DateTime]::Parse($timer.EndTime)
-            $remaining = [int]($endTime - (Get-Date)).TotalSeconds
+            $remaining = [int]($endTime - $now).TotalSeconds
         }
         catch {
             $timer.State = 'Lost'
@@ -161,13 +199,15 @@ function Sync-TimerData {
             continue
         }
 
-        # Trust JSON while the phase still has time left (avoids slow Get-ScheduledTask per timer)
+        # Trust JSON while the phase still has time left (avoids scheduler lookup per timer)
         if ($remaining -gt 2) { continue }
 
         $taskName = Get-TimerTaskName -Timer $timer
-        $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        if ($null -eq $taskNames) {
+            $taskNames = Get-PSTimerScheduledTaskNames
+        }
 
-        if ($task) {
+        if ($null -ne $taskNames -and $taskNames.Contains($taskName)) {
             continue
         }
 
@@ -203,11 +243,30 @@ function Get-TimerTaskName {
     #>
     param([PSCustomObject]$Timer)
 
-    if ($Timer.PSObject.Properties.Name -contains 'TaskName' -and -not [string]::IsNullOrWhiteSpace($Timer.TaskName)) {
+    if ($null -ne $Timer.PSObject.Properties['TaskName'] -and -not [string]::IsNullOrWhiteSpace($Timer.TaskName)) {
         return $Timer.TaskName
     }
 
     return "PSTimer_$($Timer.Id)"
+}
+
+function Find-TimerById {
+    <#
+    .SYNOPSIS
+        Finds a timer in an array by id (linear scan, no pipeline).
+    #>
+    param(
+        [array]$Timers,
+        [string]$Id
+    )
+
+    foreach ($t in $Timers) {
+        if ([string]$t.Id -eq [string]$Id) {
+            return $t
+        }
+    }
+
+    return $null
 }
 
 function New-TimerId {
@@ -1100,7 +1159,7 @@ function Register-TimerScheduledTask {
         [string]$TimerId = $null
     )
 
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    Remove-TimerScheduledTaskByName -TaskName $TaskName
 
     $action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$VbsPath`""
     $trigger = New-ScheduledTaskTrigger -Once -At $TriggerTime
@@ -1124,7 +1183,7 @@ function Set-TimerRegistrationFailed {
     param([Parameter(Mandatory)][string]$TimerId)
 
     $timers = @(Get-TimerData)
-    $timer = $timers | Where-Object { [string]$_.Id -eq [string]$TimerId }
+    $timer = Find-TimerById -Timers $timers -Id $TimerId
     if (-not $timer) { return }
 
     if ($timer.State -eq 'Running') {
@@ -1161,7 +1220,7 @@ function Register-TimerScheduledTaskAsync {
         $triggerObj = New-ScheduledTaskTrigger -Once -At $trig
         $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -Hidden
         try {
-            Unregister-ScheduledTask -TaskName $tn -Confirm:$false -ErrorAction SilentlyContinue
+            & schtasks.exe /Delete /F /TN $tn 2>$null | Out-Null
             Register-ScheduledTask -TaskName $tn -Action $action -Trigger $triggerObj -Settings $settings -Force -ErrorAction Stop | Out-Null
         }
         catch {
@@ -1391,6 +1450,247 @@ switch (`$notifyType) {
     $Timer | Add-Member -NotePropertyName 'TaskName' -NotePropertyValue $taskName -Force
 }
 
+function Clear-TimerScheduledTaskNameCache {
+    $script:TimerTaskNameCache = $null
+    $script:TimerTaskNameCacheTime = [DateTime]::MinValue
+}
+
+function Get-PSTimerScheduledTaskNames {
+    <#
+    .SYNOPSIS
+        Returns cached set of existing PSTimer_* scheduled task names (one COM enumeration per TTL).
+    #>
+    param([switch]$ForceRefresh)
+
+    $now = Get-Date
+    if (-not $ForceRefresh -and $null -ne $script:TimerTaskNameCache -and ($now - $script:TimerTaskNameCacheTime).TotalSeconds -lt $script:TimerTaskNameCacheTtlSeconds) {
+        return $script:TimerTaskNameCache
+    }
+
+    $names = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $service = $null
+    $folder = $null
+    $tasks = $null
+
+    try {
+        $service = New-Object -ComObject Schedule.Service
+        $service.Connect()
+        $folder = $service.GetFolder('\')
+        $tasks = $folder.GetTasks(1)
+
+        for ($i = 1; $i -le $tasks.Count; $i++) {
+            $name = $tasks.Item($i).Name
+            if ($name -like 'PSTimer_*') {
+                [void]$names.Add($name)
+            }
+        }
+    }
+    catch {
+        Write-Warning "PS1Timer: Could not list scheduled tasks: $($_.Exception.Message)"
+        return $names
+    }
+    finally {
+        if ($tasks) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($tasks) | Out-Null }
+        if ($folder) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($folder) | Out-Null }
+        if ($service) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($service) | Out-Null }
+    }
+
+    $script:TimerTaskNameCache = $names
+    $script:TimerTaskNameCacheTime = $now
+    return $names
+}
+
+function Remove-TimerScheduledTaskByName {
+    <#
+    .SYNOPSIS
+        Deletes one scheduled task by name via COM (no full task enumeration).
+    #>
+    param([Parameter(Mandatory)][string]$TaskName)
+
+    if ([string]::IsNullOrWhiteSpace($TaskName)) { return }
+
+    $service = $null
+    $folder = $null
+    try {
+        $service = New-Object -ComObject Schedule.Service
+        $service.Connect()
+        $folder = $service.GetFolder('\')
+        $folder.DeleteTask($TaskName, 0)
+        Clear-TimerScheduledTaskNameCache
+    }
+    catch {
+        # Task may already be gone
+    }
+    finally {
+        if ($folder) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($folder) | Out-Null }
+        if ($service) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($service) | Out-Null }
+    }
+}
+
+function Add-TimerScheduledTaskDeleteCandidates {
+    <#
+    .SYNOPSIS
+        Adds scheduled task names to delete for one timer (explicit name + optional id sweep).
+    #>
+    param(
+        [System.Collections.Generic.HashSet[string]]$DeleteSet,
+        [System.Collections.Generic.IEnumerable[string]]$ExistingNames,
+        [string]$TimerId,
+        [string]$TaskName
+    )
+
+    $legacyName = "PSTimer_$TimerId"
+    if (-not [string]::IsNullOrWhiteSpace($TaskName)) {
+        [void]$DeleteSet.Add($TaskName)
+    }
+
+    $sweepById = [string]::IsNullOrWhiteSpace($TaskName) -or ($TaskName -eq $legacyName)
+    if (-not $sweepById) {
+        return
+    }
+
+    foreach ($name in $ExistingNames) {
+        if ($name -eq $legacyName -or $name -like "PSTimer_${TimerId}_*") {
+            [void]$DeleteSet.Add($name)
+        }
+    }
+}
+
+function Remove-TimerScheduledTasks {
+    <#
+    .SYNOPSIS
+        Removes PSTimer scheduled tasks via Task Scheduler COM (one connect, one enumeration).
+    .PARAMETER All
+        Delete every task whose name starts with PSTimer_.
+    .PARAMETER TimerTargets
+        Per-timer targets: Id and optional TaskName (sweep PSTimer_{Id}_* when name is legacy or empty).
+    .PARAMETER Names
+        Explicit task names to delete (with optional TimerId sweep).
+    .PARAMETER TimerId
+        Timer id for legacy-name sweep when used with Names.
+    #>
+    param(
+        [switch]$All,
+        [array]$TimerTargets,
+        [string[]]$Names,
+        [string]$TimerId
+    )
+
+    $failed = [System.Collections.Generic.List[string]]::new()
+    $deleteSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+
+    # Fast path: explicit names only, no per-id sweep (single pause/remove of suffixed task name)
+    if (-not $All -and (-not $TimerTargets -or $TimerTargets.Count -eq 0) -and $Names -and $Names.Count -gt 0 -and [string]::IsNullOrWhiteSpace($TimerId)) {
+        foreach ($n in $Names) {
+            if ([string]::IsNullOrWhiteSpace($n)) { continue }
+            try {
+                Remove-TimerScheduledTaskByName -TaskName $n
+            }
+            catch {
+                $failed.Add($n)
+            }
+        }
+        if ($failed.Count -gt 0) {
+            Write-Warning "PS1Timer: Failed to remove scheduled task(s): $($failed -join ', ')"
+        }
+        return
+    }
+
+    $service = $null
+    $folder = $null
+    $tasks = $null
+
+    try {
+        $service = New-Object -ComObject Schedule.Service
+        $service.Connect()
+        $folder = $service.GetFolder('\')
+        $tasks = $folder.GetTasks(1)
+
+        $existing = [System.Collections.Generic.List[string]]::new()
+        for ($i = 1; $i -le $tasks.Count; $i++) {
+            $existing.Add($tasks.Item($i).Name)
+        }
+
+        if ($All) {
+            foreach ($name in $existing) {
+                if ($name -like 'PSTimer_*') {
+                    [void]$deleteSet.Add($name)
+                }
+            }
+        }
+        elseif ($TimerTargets -and $TimerTargets.Count -gt 0) {
+            foreach ($target in $TimerTargets) {
+                $id = [string]$target.Id
+                $taskName = if ($target.TaskName) { [string]$target.TaskName } else { $null }
+                Add-TimerScheduledTaskDeleteCandidates -DeleteSet $deleteSet -ExistingNames $existing -TimerId $id -TaskName $taskName
+            }
+        }
+        else {
+            if ($Names) {
+                foreach ($n in $Names) {
+                    if (-not [string]::IsNullOrWhiteSpace($n)) {
+                        [void]$deleteSet.Add($n)
+                    }
+                }
+            }
+            if ($TimerId) {
+                Add-TimerScheduledTaskDeleteCandidates -DeleteSet $deleteSet -ExistingNames $existing -TimerId $TimerId -TaskName $Names[0]
+            }
+        }
+
+        foreach ($name in $deleteSet) {
+            try {
+                $folder.DeleteTask($name, 0)
+            }
+            catch {
+                $failed.Add($name)
+            }
+        }
+    }
+    catch {
+        Write-Warning "PS1Timer: Could not connect to Task Scheduler: $($_.Exception.Message)"
+        return
+    }
+    finally {
+        if ($tasks) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($tasks) | Out-Null }
+        if ($folder) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($folder) | Out-Null }
+        if ($service) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($service) | Out-Null }
+    }
+
+    if ($failed.Count -gt 0) {
+        Write-Warning "PS1Timer: Failed to remove scheduled task(s): $($failed -join ', ')"
+    }
+
+    Clear-TimerScheduledTaskNameCache
+}
+
+function Remove-TimerTempFiles {
+    <#
+    .SYNOPSIS
+        Removes PSTimer script/vbs files from TEMP.
+    #>
+    param(
+        [switch]$All,
+        [string[]]$TimerIds
+    )
+
+    if ($All) {
+        Get-ChildItem -Path $env:TEMP -Filter 'PSTimer_*.ps1' -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+        Get-ChildItem -Path $env:TEMP -Filter 'PSTimer_*.vbs' -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+        return
+    }
+
+    foreach ($id in $TimerIds) {
+        if ([string]::IsNullOrWhiteSpace($id)) { continue }
+        $scriptPath = Join-Path $env:TEMP "PSTimer_$id.ps1"
+        $vbsPath = Join-Path $env:TEMP "PSTimer_$id.vbs"
+        Remove-Item -LiteralPath $scriptPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $vbsPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Stop-TimerTask {
     <#
     .SYNOPSIS
@@ -1401,23 +1701,18 @@ function Stop-TimerTask {
         [string]$TaskName
     )
 
+    $id = [string]$TimerId
     if (-not $TaskName) {
-        $TaskName = "PSTimer_$TimerId"
+        $TaskName = "PSTimer_$id"
     }
 
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-
-    if ($TaskName -eq "PSTimer_$TimerId") {
-        Get-ScheduledTask -TaskName "PSTimer_${TimerId}_*" -ErrorAction SilentlyContinue |
-            Where-Object { $null -ne $_ -and $_.PSObject.Properties.Name -contains 'TaskName' -and -not [string]::IsNullOrWhiteSpace($_.TaskName) } |
-            ForEach-Object { Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue }
+    if ($TaskName -eq "PSTimer_$id") {
+        Remove-TimerScheduledTasks -TimerId $id -Names @($TaskName)
     }
-
-    # Also clean up the script files
-    $scriptPath = Join-Path $env:TEMP "PSTimer_$TimerId.ps1"
-    $vbsPath = Join-Path $env:TEMP "PSTimer_$TimerId.vbs"
-    Remove-Item -LiteralPath $scriptPath -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $vbsPath -Force -ErrorAction SilentlyContinue
+    else {
+        Remove-TimerScheduledTasks -Names @($TaskName)
+    }
+    Remove-TimerTempFiles -TimerIds @($id)
 }
 # endregion Timer-Job.ps1
 
@@ -1443,23 +1738,37 @@ function Invoke-PauseTimersBulk {
     #>
     param([array]$Timers)
     $count = 0
+    $targets = [System.Collections.Generic.List[object]]::new()
+    $pausedIds = [System.Collections.Generic.List[string]]::new()
+    $now = Get-Date
+
     foreach ($t in $Timers) {
         if ($t.State -ne 'Running') { continue }
-        Stop-TimerTask -TimerId $t.Id -TaskName (Get-TimerTaskName -Timer $t)
+        $targets.Add(@{
+            Id       = [string]$t.Id
+            TaskName = Get-TimerTaskName -Timer $t
+        })
+        $pausedIds.Add([string]$t.Id)
         $endTime = [DateTime]::Parse($t.EndTime)
-        $remaining = [int]($endTime - (Get-Date)).TotalSeconds
+        $remaining = [int]($endTime - $now).TotalSeconds
         if ($remaining -lt 0) { $remaining = 0 }
         $t | Add-Member -NotePropertyName 'RemainingSeconds' -NotePropertyValue $remaining -Force
         $t.State = 'Paused'
         $count++
     }
-    Save-TimerData -Timers $Timers
+
+    if ($count -gt 0) {
+        Remove-TimerScheduledTasks -TimerTargets $targets.ToArray()
+        Remove-TimerTempFiles -TimerIds $pausedIds.ToArray()
+        Save-TimerData -Timers $Timers
+    }
+
     return $count
 }
 
 function Invoke-PauseSingleTimer {
     param([array]$Timers, [string]$Id)
-    $timer = $Timers | Where-Object { $_.Id -eq $Id }
+    $timer = Find-TimerById -Timers $Timers -Id $Id
     if (-not $timer) { return $false }
     if ($timer.State -ne 'Running') { return $null }
     Stop-TimerTask -TimerId $Id -TaskName (Get-TimerTaskName -Timer $timer)
@@ -1500,7 +1809,7 @@ function Invoke-ResumeTimersBulk {
 
 function Invoke-ResumeSingleTimer {
     param([array]$Timers, [string]$Id)
-    $timer = $Timers | Where-Object { $_.Id -eq $Id }
+    $timer = Find-TimerById -Timers $Timers -Id $Id
     if (-not $timer) { return @{ Found = $false } }
     if ($timer.State -ne 'Paused' -and $timer.State -ne 'Lost') { return @{ Found = $true; CanResume = $false } }
     $isLost = ($timer.State -eq 'Lost')
@@ -1528,18 +1837,29 @@ function Invoke-ResumeSingleTimer {
 function Invoke-RemoveTimersBulk {
     param([array]$Timers, [string]$Mode)
     if ($Mode -eq 'all') {
-        foreach ($t in $Timers) { Stop-TimerTask -TimerId $t.Id -TaskName (Get-TimerTaskName -Timer $t) }
+        Remove-TimerScheduledTasks -All
+        Remove-TimerTempFiles -All
         Save-TimerData -Timers @()
         return $Timers.Count
     }
     $toKeep = @()
     $removed = 0
+    $targets = [System.Collections.Generic.List[object]]::new()
+    $removedIds = [System.Collections.Generic.List[string]]::new()
     foreach ($t in $Timers) {
         if ($t.State -eq 'Completed' -or $t.State -eq 'Lost') {
-            Stop-TimerTask -TimerId $t.Id -TaskName (Get-TimerTaskName -Timer $t)
+            $targets.Add(@{
+                Id       = [string]$t.Id
+                TaskName = Get-TimerTaskName -Timer $t
+            })
+            $removedIds.Add([string]$t.Id)
             $removed++
         }
         else { $toKeep += $t }
+    }
+    if ($targets.Count -gt 0) {
+        Remove-TimerScheduledTasks -TimerTargets $targets.ToArray()
+        Remove-TimerTempFiles -TimerIds $removedIds.ToArray()
     }
     Save-TimerData -Timers $toKeep
     return $removed
@@ -1547,7 +1867,7 @@ function Invoke-RemoveTimersBulk {
 
 function Invoke-RemoveSingleTimer {
     param([array]$Timers, [string]$Id)
-    $timer = $Timers | Where-Object { $_.Id -eq $Id }
+    $timer = Find-TimerById -Timers $Timers -Id $Id
     if (-not $timer) { return $false }
     Stop-TimerTask -TimerId $Id -TaskName (Get-TimerTaskName -Timer $timer)
     $newList = @($Timers | Where-Object { $_.Id -ne $Id })
@@ -2844,7 +3164,6 @@ function Timer-Remove {
     }
 
     if ([string]::IsNullOrEmpty($Id)) {
-        $timers = @(Sync-TimerData)
         if ($timers.Count -eq 0) {
             Write-Host "`n  No timers to remove.`n" -ForegroundColor Gray
             return

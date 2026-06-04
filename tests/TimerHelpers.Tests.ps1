@@ -93,6 +93,12 @@ Describe "New-TimerId" {
 }
 
 Describe "Get-TimerData" {
+    BeforeEach {
+        $script:TimerDataCache = $null
+        $script:TimerDataCacheTime = [DateTime]::MinValue
+        if (Test-Path $script:TimerDataFile) { Remove-Item $script:TimerDataFile -Force }
+    }
+
     It "returns empty array when file does not exist" {
         if (Test-Path $script:TimerDataFile) { Remove-Item $script:TimerDataFile }
         $result = Get-TimerData
@@ -117,6 +123,12 @@ Describe "Get-TimerData" {
 }
 
 Describe "Save-TimerData" {
+    BeforeEach {
+        $script:TimerDataCache = $null
+        $script:TimerDataCacheTime = [DateTime]::MinValue
+        if (Test-Path $script:TimerDataFile) { Remove-Item $script:TimerDataFile -Force }
+    }
+
     It "saves timers to JSON file" {
         $testTimers = @(
             [PSCustomObject]@{
@@ -138,10 +150,13 @@ Describe "Save-TimerData" {
         $loaded.Id | Should -Be "1"
     }
 
-    It "removes file when saving empty array" {
+    It "writes empty JSON array when saving no timers" {
         "existing content" | Set-Content $script:TimerDataFile
         Save-TimerData -Timers @()
-        Test-Path $script:TimerDataFile | Should -BeFalse
+        Test-Path $script:TimerDataFile | Should -BeTrue
+        $loaded = @(Get-TimerData)
+        $loaded.Count | Should -Be 0
+        (Get-Content -LiteralPath $script:TimerDataFile -Raw).Trim() | Should -Be '[]'
     }
 }
 

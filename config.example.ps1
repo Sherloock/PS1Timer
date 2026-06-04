@@ -23,6 +23,9 @@ $global:Config = @{
         #   watch — open tw for the new timer
         #   list  — open tl -w (live list of all timers)
         AfterStart = 'none'
+
+        # Skip "PS1Timer loaded" message on import (faster profile load)
+        QuietLoad = $false
     }
 
     # Presets — sequence patterns by name (t pomodoro, tpre)

@@ -13,6 +13,13 @@ BeforeAll {
 
     $script:TimerDataFile = "$TestDrive\ps-timers.json"
     $script:TimerForceSyncRegister = $true
+
+    function Reset-TimerDataCacheForTests {
+        $script:TimerDataCache = $null
+        $script:TimerDataCacheTime = [DateTime]::MinValue
+        $script:TimerTaskNameCache = $null
+        $script:TimerTaskNameCacheTime = [DateTime]::MinValue
+    }
 }
 
 # ============================================================================
@@ -23,13 +30,13 @@ Describe "Timer" {
     BeforeAll {
         # Mock scheduled task functions
         Mock Register-ScheduledTask { }
-        Mock Unregister-ScheduledTask { }
+        Mock Remove-TimerScheduledTaskByName { }
         Mock Set-Content { } -ParameterFilter { $LiteralPath -like "*PSTimer_*.ps1" }
     }
 
     BeforeEach {
-        # Clean state before each test
-        if (Test-Path $script:TimerDataFile) { Remove-Item $script:TimerDataFile }
+        Reset-TimerDataCacheForTests
+        if (Test-Path $script:TimerDataFile) { Remove-Item $script:TimerDataFile -Force }
     }
 
     It "creates timer with valid time" {
@@ -89,12 +96,14 @@ Describe "Timer" {
 
 Describe "TimerPause" {
     BeforeAll {
-        Mock Unregister-ScheduledTask { }
+        Mock Remove-TimerScheduledTasks { }
+        Mock Remove-TimerTempFiles { }
         Mock Get-ScheduledTask { $null }
     }
 
     BeforeEach {
-        if (Test-Path $script:TimerDataFile) { Remove-Item $script:TimerDataFile }
+        Reset-TimerDataCacheForTests
+        if (Test-Path $script:TimerDataFile) { Remove-Item $script:TimerDataFile -Force }
     }
 
     It "pauses running timer" {
@@ -162,6 +171,27 @@ Describe "TimerPause" {
         $result[0].State | Should -Be "Paused"
         $result[1].State | Should -Be "Paused"
     }
+
+    It "pauses all timers with one bulk scheduled-task delete" {
+        $timers = @(
+            [PSCustomObject]@{
+                Id = "1"; Duration = "5m"; Seconds = 300; Message = "Test1"
+                StartTime = (Get-Date).ToString('o'); EndTime = (Get-Date).AddSeconds(300).ToString('o')
+                RepeatTotal = 1; RepeatRemaining = 0; CurrentRun = 1; State = "Running"
+            },
+            [PSCustomObject]@{
+                Id = "2"; Duration = "5m"; Seconds = 300; Message = "Test2"
+                StartTime = (Get-Date).ToString('o'); EndTime = (Get-Date).AddSeconds(300).ToString('o')
+                RepeatTotal = 1; RepeatRemaining = 0; CurrentRun = 1; State = "Running"
+            }
+        )
+        Save-TimerData -Timers $timers
+
+        TimerPause -Id "all"
+
+        Assert-MockCalled Remove-TimerScheduledTasks -Times 1 -Exactly -ParameterFilter { $TimerTargets -and $TimerTargets.Count -ge 2 }
+        Assert-MockCalled Remove-TimerTempFiles -Times 1 -Exactly -ParameterFilter { $TimerIds -and $TimerIds.Count -ge 2 }
+    }
 }
 
 # ============================================================================
@@ -171,12 +201,14 @@ Describe "TimerPause" {
 Describe "TimerResume" {
     BeforeAll {
         Mock Register-ScheduledTask { }
-        Mock Unregister-ScheduledTask { }
+        Mock Remove-TimerScheduledTaskByName { }
+        Mock Remove-TimerScheduledTasks { }
         Mock Set-Content { } -ParameterFilter { $LiteralPath -like "*PSTimer_*.ps1" }
     }
 
     BeforeEach {
-        if (Test-Path $script:TimerDataFile) { Remove-Item $script:TimerDataFile }
+        Reset-TimerDataCacheForTests
+        if (Test-Path $script:TimerDataFile) { Remove-Item $script:TimerDataFile -Force }
     }
 
     It "resumes paused timer" {
@@ -251,12 +283,13 @@ Describe "TimerResume" {
 
 Describe "TimerRemove" {
     BeforeAll {
-        Mock Unregister-ScheduledTask { }
-        Mock Remove-Item { } -ParameterFilter { $LiteralPath -like "*PSTimer_*.ps1" }
+        Mock Remove-TimerScheduledTasks { }
+        Mock Remove-TimerTempFiles { }
     }
 
     BeforeEach {
-        if (Test-Path $script:TimerDataFile) { Remove-Item $script:TimerDataFile }
+        Reset-TimerDataCacheForTests
+        if (Test-Path $script:TimerDataFile) { Remove-Item $script:TimerDataFile -Force }
     }
 
     It "removes specific timer by ID" {
@@ -297,6 +330,27 @@ Describe "TimerRemove" {
         $result.Count | Should -Be 0
     }
 
+    It "removes all timers with one bulk scheduled-task delete" {
+        $timers = @(
+            [PSCustomObject]@{
+                Id = "1"; Duration = "5m"; Seconds = 300; Message = "Test1"
+                StartTime = (Get-Date).ToString('o'); EndTime = (Get-Date).AddSeconds(300).ToString('o')
+                RepeatTotal = 1; RepeatRemaining = 0; CurrentRun = 1; State = "Running"
+            },
+            [PSCustomObject]@{
+                Id = "2"; Duration = "5m"; Seconds = 300; Message = "Test2"
+                StartTime = (Get-Date).ToString('o'); EndTime = (Get-Date).AddSeconds(300).ToString('o')
+                RepeatTotal = 1; RepeatRemaining = 0; CurrentRun = 1; State = "Running"
+            }
+        )
+        Save-TimerData -Timers $timers
+
+        TimerRemove -Id "all"
+
+        Assert-MockCalled Remove-TimerScheduledTasks -Times 1 -Exactly -ParameterFilter { $All }
+        Assert-MockCalled Remove-TimerTempFiles -Times 1 -Exactly -ParameterFilter { $All }
+    }
+
     It "removes only completed/lost timers with 'done' parameter" {
         $timers = @(
             [PSCustomObject]@{
@@ -331,12 +385,12 @@ Describe "TimerRemove" {
 
 Describe "Sync-TimerData" {
     BeforeAll {
-        Mock Get-ScheduledTask { $null }
-        Mock Get-ScheduledTaskInfo { $null }
+        Mock Get-PSTimerScheduledTaskNames { [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase) }
     }
 
     BeforeEach {
-        if (Test-Path $script:TimerDataFile) { Remove-Item $script:TimerDataFile }
+        Reset-TimerDataCacheForTests
+        if (Test-Path $script:TimerDataFile) { Remove-Item $script:TimerDataFile -Force }
     }
 
     It "marks timer as Lost when task missing and time expired" {
@@ -360,7 +414,9 @@ Describe "Sync-TimerData" {
     }
 
     It "keeps timer Running when task exists" {
-        Mock Get-ScheduledTask { @{ TaskName = "PSTimer_1" } }
+        $existing = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        [void]$existing.Add('PSTimer_1')
+        Mock Get-PSTimerScheduledTaskNames { return $existing }
 
         $timer = [PSCustomObject]@{
             Id = "1"
@@ -409,12 +465,12 @@ Describe "Sync-TimerData" {
 
 Describe "TimerList" {
     BeforeAll {
-        Mock Get-ScheduledTask { $null }
-        Mock Get-ScheduledTaskInfo { $null }
+        Mock Get-PSTimerScheduledTaskNames { [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase) }
     }
 
     BeforeEach {
-        if (Test-Path $script:TimerDataFile) { Remove-Item $script:TimerDataFile }
+        Reset-TimerDataCacheForTests
+        if (Test-Path $script:TimerDataFile) { Remove-Item $script:TimerDataFile -Force }
     }
 
     It "shows message when no timers exist" {
@@ -453,7 +509,8 @@ Describe "Show-TimerWatchDisplay" {
     }
 
     BeforeEach {
-        if (Test-Path $script:TimerDataFile) { Remove-Item $script:TimerDataFile }
+        Reset-TimerDataCacheForTests
+        if (Test-Path $script:TimerDataFile) { Remove-Item $script:TimerDataFile -Force }
         $script:WatchDisplayCallCount = 0
     }
 
@@ -542,8 +599,8 @@ Describe "Timer scheduled task helpers" {
         Get-TimerAfterStartAction -Override 'watch' | Should -Be 'watch'
     }
 
-    It "Sync-TimerData skips Get-ScheduledTask when end time is far in the future" {
-        Mock Get-ScheduledTask { throw 'should not be called' }
+    It "Sync-TimerData skips scheduled-task lookup when end time is far in the future" {
+        Mock Get-PSTimerScheduledTaskNames { throw 'should not be called' }
         $future = (Get-Date).AddMinutes(30).ToString('o')
         $timers = @(
             [PSCustomObject]@{
@@ -556,18 +613,19 @@ Describe "Timer scheduled task helpers" {
         )
         Mock Get-TimerData { return $timers }
         { Sync-TimerData } | Should -Not -Throw
-        Assert-MockCalled Get-ScheduledTask -Times 0 -Exactly
+        Assert-MockCalled Get-PSTimerScheduledTaskNames -Times 0 -Exactly
     }
 }
 
 Describe "Sequence phase advance (JSON)" {
     BeforeAll {
         Mock Register-ScheduledTask { }
-        Mock Unregister-ScheduledTask { }
+        Mock Remove-TimerScheduledTaskByName { }
     }
 
     BeforeEach {
-        if (Test-Path $script:TimerDataFile) { Remove-Item $script:TimerDataFile }
+        Reset-TimerDataCacheForTests
+        if (Test-Path $script:TimerDataFile) { Remove-Item $script:TimerDataFile -Force }
     }
 
     It "starts sequence with multiple phases in JSON" {
