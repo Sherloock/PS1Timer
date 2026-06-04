@@ -99,15 +99,16 @@ Works out of the box — no copy step required.
 
 | File | Role |
 |------|------|
-| [`config.example.ps1`](config.example.ps1) | Default settings — **loaded automatically** when `config.ps1` is absent |
+| [`config.example.ps1`](config.example.ps1) | Defaults + **19 presets** — loaded automatically when `config.ps1` is absent |
 | `config.ps1` | Optional personal settings (gitignored) — **replaces** the example when present |
-| [`src/BuiltInPresets.ps1`](src/BuiltInPresets.ps1) | Shipped preset definitions — edit only when contributing |
 
-To customize notifications or add/override presets:
+`TimerDefaults` keys: `Notify`, `SoundFile`, `AfterStart` (`none` | `watch` | `list`).
+
+To customize:
 
 ```powershell
 Copy-Item config.example.ps1 config.ps1
-# Edit config.ps1 — set TimerDefaults.Notify, add TimerPresets, etc.
+# Edit config.ps1 — Presets, TimerDefaults.Notify, TimerDefaults.AfterStart, etc.
 ```
 
 Then reload the module:
@@ -125,9 +126,8 @@ PS1Timer/
 ├── PS1Timer.psd1          # Module manifest
 ├── PS1Timer.psm1          # Loader (config + sources)
 ├── loader.ps1             # Profile entry point
-├── config.example.ps1     # Default config (auto-loaded)
+├── config.example.ps1     # Config + Presets (auto-loaded)
 ├── src/
-│   ├── BuiltInPresets.ps1 # 19 built-in presets
 │   ├── Timer.ps1          # Timer commands
 │   └── TimerHelpers.ps1   # Parsing, UI helpers
 ├── docs/                  # Full documentation

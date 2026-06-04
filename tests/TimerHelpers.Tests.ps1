@@ -7,7 +7,6 @@ BeforeAll {
     if (Test-Path -LiteralPath $exampleConfig) {
         . $exampleConfig
     }
-    . "$ModuleRoot\src\BuiltInPresets.ps1"
     . "$ModuleRoot\src\TimerHelpers.ps1"
     . "$ModuleRoot\src\Timer.ps1"
 

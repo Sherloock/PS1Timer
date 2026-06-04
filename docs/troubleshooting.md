@@ -1,5 +1,29 @@
 # Troubleshooting
 
+## Windows Script Host error on PSTimer_*.vbs
+
+**Symptom:** Popup: `Expected end of statement` (800A0401) on line 2 of `%TEMP%\PSTimer_<id>.vbs`.
+
+**Cause:** Older builds quoted `pwsh.exe` paths incorrectly when installed under `Program Files`.
+
+**Fix:** Update PS1Timer (VBS now uses `Chr(34)` quoting). Reload the module, remove the broken timer (`td <id>`), start again.
+
+## Sequence stops after the first phase
+
+**Symptoms:** Phase 1 notification appears, but phase 2 never starts (`tl` shows `Lost`, `Paused`, or stuck).
+
+**Checks:**
+
+1. Log file: `%TEMP%\PSTimer_<id>.log` — registration or phase-index errors are appended there.
+2. Ensure `pwsh.exe` (PowerShell 7.4+) is on PATH — fire scripts launch via pwsh, not Windows PowerShell 5.1.
+3. List state: `tl` then resume if paused: `tr <id>`.
+
+**Note:** `t` returns immediately while the scheduled task registers in the background (about 1–2 seconds). If registration fails, the timer is marked `Paused` with remaining time preserved.
+
+## Commands feel slow (~3 seconds)
+
+Older versions blocked on `Register-ScheduledTask` for every `t` command. Current builds register in the background; confirmation should appear instantly. `tl` is also faster when timers still have time left (no per-timer task scan).
+
 ## Timer shows Lost
 
 **Cause:** Scheduled task was removed or failed, and the end time passed.
@@ -83,10 +107,10 @@ Requires Pester 5.x — `Run-Tests.ps1` installs it if missing.
 
 ## Wrong preset count or missing preset
 
-Built-ins come from `src/BuiltInPresets.ps1`. After editing, reload:
+Presets live in `config.example.ps1` / `config.ps1` under `Presets`. After editing, reload:
 
 ```powershell
 Import-Module .\PS1Timer.psd1 -Force
 ```
 
-Custom presets belong in `config.ps1` under `TimerPresets`.
+Custom presets belong in `config.ps1` under `Presets`.

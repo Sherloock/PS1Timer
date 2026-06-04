@@ -4,11 +4,27 @@ All notable changes to PS1Timer are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- `TimerDefaults.AfterStart`: `none` | `watch` | `list` — optional `tw` or `tl -w` after starting a timer
+- Per-command `-AfterStart` on `Timer` / `t`
+
 ### Changed
 
 - `config.example.ps1` loads automatically when `config.ps1` is absent (zero-config install)
-- Built-in presets moved from `config/presets.ps1` to `src/BuiltInPresets.ps1`
-- README and docs clarify configuration model (example vs personal `config.ps1`)
+- All presets live in `Config.Presets` inside config (removed `src/BuiltInPresets.ps1`)
+- `TimerPresets` config key deprecated in favor of `Presets`
+
+### Fixed
+
+- VBS launcher uses `Chr(34)` quoting so `pwsh` under `Program Files` no longer breaks scheduled tasks
+- Preset/sequence timers advance to phase 2+ (pwsh fire script, `@(Phases)` coercion, register-then-save, live `TaskName`)
+- Scheduled-task registration no longer blocks the CLI (~3s delay); registers in a background job
+
+### Performance
+
+- `Sync-TimerData` skips `Get-ScheduledTask` while a running timer still has >2s remaining
+- `Stop-TimerTask` skips wildcard task scan when a concrete `TaskName` is known
 
 ## [1.0.0] - 2026-05-31
 

@@ -1,6 +1,6 @@
 # Presets
 
-Built-in presets live in [`src/BuiltInPresets.ps1`](../src/BuiltInPresets.ps1). User overrides merge on top via `config.ps1` (or defaults from `config.example.ps1`).
+All presets are defined in [`config.example.ps1`](../config.example.ps1) under **`Presets`**, or in your gitignored `config.ps1` when you copy the example.
 
 ## Usage
 
@@ -10,7 +10,7 @@ tpre                # interactive picker
 Timer-Presets       # same as tpre
 ```
 
-## Built-in presets (19)
+## Shipped presets (19)
 
 | Name | Pattern | Use case |
 |------|---------|----------|
@@ -34,27 +34,22 @@ Timer-Presets       # same as tpre
 | `flowtime` | `(45m focus, 15m break)x4` | Flexible deep work |
 | `ultradian` | `(90m focus, 20m break)x2` | Natural rhythm |
 
-## Add or override presets
+## Customize presets
 
-Copy `config.example.ps1` to `config.ps1` and add under `TimerPresets`:
+Copy `config.example.ps1` to `config.ps1` and edit the `Presets` table:
 
 ```powershell
-$global:Config = @{
-    TimerDefaults = @{
-        Notify    = 'popup'
-        SoundFile = $null
+Presets = @{
+    'my-focus' = @{
+        Pattern     = '(40m focus, 10m break)x3'
+        Description = 'Custom 40/10 rhythm'
     }
-    TimerPresets = @{
-        'my-focus' = @{
-            Pattern     = '(40m focus, 10m break)x3'
-            Description = 'Custom 40/10 rhythm'
-        }
-    }
+    # ... keep or remove shipped entries
 }
 ```
 
-User presets **merge** with built-ins; same key replaces the built-in entry.
+Reload: `Import-Module .\PS1Timer.psd1 -Force`
 
-## Edit built-ins for everyone
+## Deprecated: TimerPresets
 
-To change defaults for all users of your fork, edit `src/BuiltInPresets.ps1` directly and run tests.
+Older configs used `TimerPresets` instead of `Presets`. That key still works with a warning; rename to `Presets`.

@@ -5,10 +5,11 @@
 Start a simple countdown, sequence, or preset.
 
 ```powershell
-Timer -Time 25m -Message "Focus" [-Repeat 3] [-Notify toast|popup|sound|silent]
+Timer -Time 25m -Message "Focus" [-Repeat 3] [-Notify toast|popup|sound|silent] [-AfterStart none|watch|list]
 t 25m
 t pomodoro
 t "(25m work, 5m rest)x2"
+t 25m -AfterStart watch
 ```
 
 | Parameter | Description |
@@ -17,6 +18,7 @@ t "(25m work, 5m rest)x2"
 | `-Message` | Notification text (default: `Time is up!`) |
 | `-Repeat` | Number of runs (default: 1) |
 | `-Notify` | Override default notification mode |
+| `-AfterStart` | After start: `none` (default), `watch` (`tw <id>`), `list` (`tl -w`). Default from `TimerDefaults.AfterStart` in config |
 
 Bare `t` or `Timer` with no arguments shows the help menu.
 

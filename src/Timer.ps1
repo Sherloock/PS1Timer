@@ -9,6 +9,9 @@ $script:TimerDataFile = Join-Path $env:TEMP "ps-timers.json"
 # Cache for watch mode optimization
 $script:TimerDataCache = $null
 $script:TimerDataCacheTime = [DateTime]::MinValue
+$script:PS1TimerPwsh = (Get-Command pwsh.exe -ErrorAction Stop).Source
+# Tests set $true so Register-ScheduledTask mocks apply in-process
+$script:TimerForceSyncRegister = $false
 
 function Get-TimerData {
     <#
@@ -111,6 +114,10 @@ function Save-TimerData {
             }
 
             # Add sequence-specific fields if present
+            if ($t.PSObject.Properties.Name -contains 'NotifyType' -and $t.NotifyType) {
+                $obj | Add-Member -NotePropertyName 'NotifyType' -NotePropertyValue $t.NotifyType
+            }
+
             if ($t.IsSequence) {
                 $obj | Add-Member -NotePropertyName 'SequencePattern' -NotePropertyValue $t.SequencePattern
                 $obj | Add-Member -NotePropertyName 'Phases' -NotePropertyValue $t.Phases
@@ -124,7 +131,9 @@ function Save-TimerData {
         }
     }
 
-    ConvertTo-Json -InputObject $clean -Depth 10 | Set-Content -LiteralPath $script:TimerDataFile -Force
+    $utf8Bom = New-Object System.Text.UTF8Encoding $true
+    [System.IO.File]::WriteAllText($script:TimerDataFile, (ConvertTo-Json -InputObject $clean -Depth 10), $utf8Bom)
+    $script:TimerDataCacheTime = [DateTime]::MinValue
 }
 
 function Sync-TimerData {
@@ -141,45 +150,31 @@ function Sync-TimerData {
     foreach ($timer in $timers) {
         if ($timer.State -ne 'Running') { continue }
 
+        try {
+            $endTime = [DateTime]::Parse($timer.EndTime)
+            $remaining = [int]($endTime - (Get-Date)).TotalSeconds
+        }
+        catch {
+            $timer.State = 'Lost'
+            $timer | Add-Member -NotePropertyName 'RemainingSeconds' -NotePropertyValue $timer.Seconds -Force
+            $changed = $true
+            continue
+        }
+
+        # Trust JSON while the phase still has time left (avoids slow Get-ScheduledTask per timer)
+        if ($remaining -gt 2) { continue }
+
         $taskName = Get-TimerTaskName -Timer $timer
         $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 
         if ($task) {
-            # Task exists - timer is still active, check if it ran
-            $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
-            if ($taskInfo -and $taskInfo.LastRunTime -and $taskInfo.LastRunTime -gt [DateTime]::MinValue) {
-                # Task has run - the script should have updated the JSON
-                # Re-read to get any changes made by the scheduled task
-                $freshTimers = @(Get-TimerData)
-                $freshTimer = $freshTimers | Where-Object { $_.Id -eq $timer.Id }
-                if ($freshTimer -and $freshTimer.State -ne $timer.State) {
-                    return $freshTimers  # Return updated data
-                }
-            }
-            # Task exists and hasn't run yet - timer is valid
+            continue
         }
-        else {
-            # Task not found - check if timer should have ended
-            try {
-                $endTime = [DateTime]::Parse($timer.EndTime)
-                $remaining = [int]($endTime - (Get-Date)).TotalSeconds
 
-                if ($remaining -le 0) {
-                    # Timer expired without task - mark as lost
-                    $timer.State = 'Lost'
-                    # Save 0 remaining (cycle expired)
-                    $timer | Add-Member -NotePropertyName 'RemainingSeconds' -NotePropertyValue 0 -Force
-                    $changed = $true
-                }
-                # Otherwise, task might still be scheduling - give it a moment
-                # If still no task after end time, mark as lost with remaining time
-            }
-            catch {
-                # Invalid EndTime format - mark as lost
-                $timer.State = 'Lost'
-                $timer | Add-Member -NotePropertyName 'RemainingSeconds' -NotePropertyValue $timer.Seconds -Force
-                $changed = $true
-            }
+        if ($remaining -le 0) {
+            $timer.State = 'Lost'
+            $timer | Add-Member -NotePropertyName 'RemainingSeconds' -NotePropertyValue 0 -Force
+            $changed = $true
         }
     }
 
@@ -771,6 +766,42 @@ function Get-TimerNotificationConfig {
     return $defaults
 }
 
+function Get-TimerAfterStartAction {
+    <#
+    .SYNOPSIS
+        Resolves AfterStart behavior from config or per-command override.
+    #>
+    param([string]$Override = $null)
+
+    $valid = @('none', 'watch', 'list')
+    if ($Override -and ($valid -contains $Override)) {
+        return $Override
+    }
+    if ($global:Config -and $global:Config.TimerDefaults -and $global:Config.TimerDefaults.AfterStart) {
+        $configured = $global:Config.TimerDefaults.AfterStart
+        if ($valid -contains $configured) {
+            return $configured
+        }
+    }
+    return 'none'
+}
+
+function Invoke-TimerAfterStart {
+    <#
+    .SYNOPSIS
+        Runs configured post-start UI (watch new timer or live list).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$TimerId,
+        [string]$AfterStart = $null
+    )
+
+    switch (Get-TimerAfterStartAction -Override $AfterStart) {
+        'watch' { Timer-Watch -Id $TimerId }
+        'list'  { Timer-List -Watch }
+    }
+}
+
 function Show-TimerNotification {
     <#
     .SYNOPSIS
@@ -1022,6 +1053,145 @@ function Show-TimerNotificationHelp {
 # region Timer-Job.ps1
 # Timer module - Windows Scheduled Tasks integration
 
+function Get-TimerVbsWrapperScript {
+    <#
+    .SYNOPSIS
+        Builds a VBS launcher that runs a .ps1 file via pwsh (hidden).
+    .DESCRIPTION
+        Uses Chr(34) quoting so paths with spaces (e.g. Program Files) compile in VBScript.
+    #>
+    param([Parameter(Mandatory)][string]$Ps1Path)
+
+    $pwsh = $script:PS1TimerPwsh.Replace('"', '""')
+    $ps1 = $Ps1Path.Replace('"', '""')
+    $args = ' -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File '
+    return (
+        'Set WshShell = CreateObject("WScript.Shell")' + [char]13 + [char]10 +
+        'WshShell.Run Chr(34) & "' + $pwsh + '" & Chr(34) & "' + $args + '" & Chr(34) & "' + $ps1 + '" & Chr(34), 0, False' + [char]13 + [char]10 +
+        'Set WshShell = Nothing'
+    )
+}
+
+function Write-TimerFireScriptFile {
+    param(
+        [Parameter(Mandatory)][string]$TimerId,
+        [Parameter(Mandatory)][string]$ScriptBody
+    )
+    $scriptPath = Join-Path $env:TEMP "PSTimer_$TimerId.ps1"
+    $utf8Bom = New-Object System.Text.UTF8Encoding $true
+    [System.IO.File]::WriteAllText($scriptPath, $ScriptBody, $utf8Bom)
+    return $scriptPath
+}
+
+function Write-TimerVbsWrapperFile {
+    param([Parameter(Mandatory)][string]$TimerId)
+    $scriptPath = Join-Path $env:TEMP "PSTimer_$TimerId.ps1"
+    $vbsPath = Join-Path $env:TEMP "PSTimer_$TimerId.vbs"
+    $vbsScript = Get-TimerVbsWrapperScript -Ps1Path $scriptPath
+    $vbsScript | Set-Content -LiteralPath $vbsPath -Force -Encoding Ascii
+    return $vbsPath
+}
+
+function Register-TimerScheduledTask {
+    param(
+        [Parameter(Mandatory)][string]$TaskName,
+        [Parameter(Mandatory)][datetime]$TriggerTime,
+        [Parameter(Mandatory)][string]$VbsPath,
+        [string]$TimerId = $null
+    )
+
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+
+    $action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$VbsPath`""
+    $trigger = New-ScheduledTaskTrigger -Once -At $TriggerTime
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -Hidden
+
+    try {
+        Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Force -ErrorAction Stop | Out-Null
+        return $true
+    }
+    catch {
+        if ($TimerId) {
+            $log = Join-Path $env:TEMP "PSTimer_$TimerId.log"
+            "$(Get-Date -Format 'o') ERROR register task '$TaskName': $($_.Exception.Message)" | Add-Content -LiteralPath $log -Force
+            Set-TimerRegistrationFailed -TimerId $TimerId
+        }
+        return $false
+    }
+}
+
+function Set-TimerRegistrationFailed {
+    param([Parameter(Mandatory)][string]$TimerId)
+
+    $timers = @(Get-TimerData)
+    $timer = $timers | Where-Object { [string]$_.Id -eq [string]$TimerId }
+    if (-not $timer) { return }
+
+    if ($timer.State -eq 'Running') {
+        try {
+            $remaining = [int]([DateTime]::Parse($timer.EndTime) - (Get-Date)).TotalSeconds
+            if ($remaining -lt 0) { $remaining = [int]$timer.Seconds }
+        }
+        catch {
+            $remaining = [int]$timer.Seconds
+        }
+        $timer.State = 'Paused'
+        $timer | Add-Member -NotePropertyName 'RemainingSeconds' -NotePropertyValue $remaining -Force
+        $timer.TaskName = $null
+        Save-TimerData -Timers $timers
+    }
+}
+
+function Register-TimerScheduledTaskAsync {
+    param(
+        [Parameter(Mandatory)][string]$TimerId,
+        [Parameter(Mandatory)][string]$TaskName,
+        [Parameter(Mandatory)][datetime]$TriggerTime,
+        [Parameter(Mandatory)][string]$VbsPath
+    )
+
+    if ($script:TimerForceSyncRegister) {
+        $null = Register-TimerScheduledTask -TaskName $TaskName -TriggerTime $TriggerTime -VbsPath $VbsPath -TimerId $TimerId
+        return
+    }
+
+    $null = Start-Job -Name "PSTimerReg_$TaskName" -ScriptBlock {
+        param($tn, $trig, $vbs, $tid, $dataFile)
+        $action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$vbs`""
+        $triggerObj = New-ScheduledTaskTrigger -Once -At $trig
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -Hidden
+        try {
+            Unregister-ScheduledTask -TaskName $tn -Confirm:$false -ErrorAction SilentlyContinue
+            Register-ScheduledTask -TaskName $tn -Action $action -Trigger $triggerObj -Settings $settings -Force -ErrorAction Stop | Out-Null
+        }
+        catch {
+            $log = Join-Path $env:TEMP "PSTimer_$tid.log"
+            "$(Get-Date -Format 'o') ERROR register task '$tn': $($_.Exception.Message)" | Add-Content -LiteralPath $log -Force
+            if (Test-Path -LiteralPath $dataFile) {
+                try {
+                    $parsed = Get-Content -LiteralPath $dataFile -Raw | ConvertFrom-Json
+                    $list = @()
+                    if ($parsed -is [array]) { $list = @($parsed) } else { $list = @($parsed) }
+                    foreach ($t in $list) {
+                        if ([string]$t.Id -ne [string]$tid) { continue }
+                        if ($t.State -ne 'Running') { break }
+                        $rem = 0
+                        try { $rem = [int]([DateTime]::Parse($t.EndTime) - (Get-Date)).TotalSeconds } catch { $rem = [int]$t.Seconds }
+                        if ($rem -lt 0) { $rem = [int]$t.Seconds }
+                        $t.State = 'Paused'
+                        $t | Add-Member -NotePropertyName 'RemainingSeconds' -NotePropertyValue $rem -Force
+                        $t.TaskName = $null
+                        break
+                    }
+                    $utf8Bom = New-Object System.Text.UTF8Encoding $true
+                    [System.IO.File]::WriteAllText($dataFile, (ConvertTo-Json -InputObject $list -Depth 10), $utf8Bom)
+                }
+                catch { }
+            }
+        }
+    } -ArgumentList $TaskName, $TriggerTime, $VbsPath, $TimerId, $script:TimerDataFile | Out-Null
+}
+
 function Start-TimerJob {
     <#
     .SYNOPSIS
@@ -1214,26 +1384,10 @@ switch (`$notifyType) {
 }
 "@
 
-    # Write script to temp file (scheduled tasks work better with script files)
-    $scriptPath = Join-Path $env:TEMP "PSTimer_$($Timer.Id).ps1"
-    $script | Set-Content -LiteralPath $scriptPath -Force -Encoding UTF8
+    $null = Write-TimerFireScriptFile -TimerId $Timer.Id -ScriptBody $script
+    $vbsPath = Write-TimerVbsWrapperFile -TimerId $Timer.Id
 
-    # Create VBS wrapper for truly invisible execution
-    $vbsPath = Join-Path $env:TEMP "PSTimer_$($Timer.Id).vbs"
-    $vbsScript = 'Set WshShell = CreateObject("WScript.Shell")' + [char]13 + [char]10 + `
-        'WshShell.Run "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ""' + $scriptPath + '""", 0, False' + [char]13 + [char]10 + `
-        'Set WshShell = Nothing'
-    $vbsScript | Set-Content -LiteralPath $vbsPath -Force -Encoding Ascii
-
-    # Remove any existing task with same name
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-
-    # Create scheduled task (completely hidden - uses VBS wrapper)
-    $action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$vbsPath`""
-    $trigger = New-ScheduledTaskTrigger -Once -At $triggerTime
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -Hidden
-
-    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
+    Register-TimerScheduledTaskAsync -TimerId $Timer.Id -TaskName $taskName -TriggerTime $triggerTime -VbsPath $vbsPath
     $Timer | Add-Member -NotePropertyName 'TaskName' -NotePropertyValue $taskName -Force
 }
 
@@ -1252,9 +1406,12 @@ function Stop-TimerTask {
     }
 
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-    Get-ScheduledTask -TaskName "PSTimer_${TimerId}_*" -ErrorAction SilentlyContinue |
-        Where-Object { $null -ne $_ -and $_.PSObject.Properties.Name -contains 'TaskName' -and -not [string]::IsNullOrWhiteSpace($_.TaskName) } |
-        ForEach-Object { Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue }
+
+    if ($TaskName -eq "PSTimer_$TimerId") {
+        Get-ScheduledTask -TaskName "PSTimer_${TimerId}_*" -ErrorAction SilentlyContinue |
+            Where-Object { $null -ne $_ -and $_.PSObject.Properties.Name -contains 'TaskName' -and -not [string]::IsNullOrWhiteSpace($_.TaskName) } |
+            ForEach-Object { Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction SilentlyContinue }
+    }
 
     # Also clean up the script files
     $scriptPath = Join-Path $env:TEMP "PSTimer_$TimerId.ps1"
@@ -1402,19 +1559,23 @@ function Invoke-RemoveSingleTimer {
 # region Timer-Sequence.ps1
 # Timer module - Sequence timer parsing and handling
 
-# Timer presets - built-ins from src/BuiltInPresets.ps1, optional user overrides in config.ps1
-if (-not $script:BuiltInTimerPresets -or $script:BuiltInTimerPresets.Count -eq 0) {
-    throw 'PS1Timer: BuiltInTimerPresets not initialized. Load src/BuiltInPresets.ps1 before Timer.ps1.'
-}
-
+# Timer presets — loaded from Config.Presets (config.example.ps1 or config.ps1)
 $script:TimerPresets = @{}
-foreach ($presetKey in $script:BuiltInTimerPresets.Keys) {
-    $script:TimerPresets[$presetKey] = $script:BuiltInTimerPresets[$presetKey]
+$presetSource = $null
+if ($global:Config -and $global:Config.Presets) {
+    $presetSource = $global:Config.Presets
 }
-if ($global:Config -and $global:Config.TimerPresets) {
-    foreach ($presetKey in $global:Config.TimerPresets.Keys) {
-        $script:TimerPresets[$presetKey] = $global:Config.TimerPresets[$presetKey]
+elseif ($global:Config -and $global:Config.TimerPresets) {
+    Write-Warning 'PS1Timer: Config.TimerPresets is deprecated; use Config.Presets instead.'
+    $presetSource = $global:Config.TimerPresets
+}
+if ($presetSource) {
+    foreach ($presetKey in $presetSource.Keys) {
+        $script:TimerPresets[$presetKey] = $presetSource[$presetKey]
     }
+}
+if ($script:TimerPresets.Count -eq 0) {
+    throw 'PS1Timer: Config.Presets is empty. Check config.example.ps1 or config.ps1.'
 }
 
 function Test-TimerSequence {
@@ -1798,26 +1959,35 @@ function Start-SequenceTimerJob {
 `$timerId = '$($Timer.Id)'
 `$dataFile = '$dataFile'
 `$notifyType = '$notifyType'
-`$currentTaskName = '$taskName'
 `$logFile = "`$env:TEMP\PSTimer_`$timerId.log"
+`$utf8Bom = New-Object System.Text.UTF8Encoding `$true
+
+function Write-TimerDataFile {
+    param([array]`$Items)
+    [System.IO.File]::WriteAllText(`$dataFile, (ConvertTo-Json -InputObject `$Items -Depth 10), `$utf8Bom)
+}
 
 try {
 
-# Read current timer state from JSON
 if (-not (Test-Path -LiteralPath `$dataFile)) { exit }
-`$jsonContent = Get-Content -LiteralPath `$dataFile -Raw -ErrorAction SilentlyContinue
+`$jsonContent = Get-Content -LiteralPath `$dataFile -Raw -ErrorAction Stop
 `$parsed = `$jsonContent | ConvertFrom-Json
-`$timers = New-Object System.Collections.ArrayList
-`$parsed | ForEach-Object { [void]`$timers.Add(`$_) }
-`$timer = `$timers | Where-Object { `$_.Id -eq `$timerId }
+`$timers = @()
+if (`$parsed -is [array]) { `$timers = @(`$parsed) } else { `$timers = @(`$parsed) }
 
-if (-not `$timer -or -not `$timer.IsSequence) { exit }
+`$timerIndex = -1
+for (`$i = 0; `$i -lt `$timers.Count; `$i++) {
+    if ([string]`$timers[`$i].Id -eq [string]`$timerId) { `$timerIndex = `$i; break }
+}
+if (`$timerIndex -lt 0) { exit }
+`$timer = `$timers[`$timerIndex]
+if (-not `$timer.IsSequence) { exit }
 
+`$currentTaskName = `$timer.TaskName
 `$currentPhase = [int]`$timer.CurrentPhase
 `$totalPhases = [int]`$timer.TotalPhases
 `$phaseLabel = `$timer.PhaseLabel
 
-# Sound notification (if not silent)
 if (`$notifyType -ne 'silent') {
     try {
         if (`$currentPhase -eq `$totalPhases - 1) {
@@ -1831,53 +2001,66 @@ if (`$notifyType -ne 'silent') {
 `$nextPhaseIdx = `$currentPhase + 1
 
 if (`$nextPhaseIdx -lt `$totalPhases) {
-    # More phases to go
-    `$phases = `$timer.Phases
-    `$nextPhase = `$phases[`$nextPhaseIdx]
-    `$nextSeconds = [int]`$nextPhase.Seconds
-    `$nextLabel = `$nextPhase.Label
-    `$nextTaskName = "PSTimer_`$timerId_`$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
-    
-    `$timer.CurrentPhase = `$nextPhaseIdx
-    `$timer.PhaseLabel = `$nextLabel
-    `$timer.Seconds = `$nextSeconds
-    `$timer.Message = `$nextLabel
-    `$timer.StartTime = (Get-Date).ToString('o')
-    `$timer.EndTime = (Get-Date).AddSeconds(`$nextSeconds).ToString('o')
-    `$timer.State = 'Running'
-    `$timer.TaskName = `$nextTaskName
-    
-    # Save JSON BEFORE scheduling next task so state is persisted even if Register fails
-    ConvertTo-Json -InputObject `$timers -Depth 10 | Set-Content -LiteralPath `$dataFile -Force
+    `$phases = @(`$timer.Phases)
+    if (`$nextPhaseIdx -ge `$phases.Count) {
+        "`$(Get-Date -Format 'o') ERROR invalid phase index `$nextPhaseIdx (count=`$(`$phases.Count))" | Add-Content -LiteralPath `$logFile -Force
+        `$timer.State = 'Lost'
+        `$timer.TaskName = `$null
+        Write-TimerDataFile -Items `$timers
+    } else {
+        `$nextPhase = `$phases[`$nextPhaseIdx]
+        `$nextSeconds = [int]`$nextPhase.Seconds
+        `$nextLabel = `$nextPhase.Label
+        `$nextTaskName = "PSTimer_`$timerId_`$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
 
-    # Schedule next phase (completely hidden - uses existing VBS wrapper)
-    `$nextTrigger = (Get-Date).AddSeconds(`$nextSeconds)
-    `$vbsPath = "`$env:TEMP\PSTimer_`$timerId.vbs"
-    `$nextAction = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument `"`$vbsPath`"
-    `$nextTriggerObj = New-ScheduledTaskTrigger -Once -At `$nextTrigger
-    `$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -Hidden
+        `$nextTrigger = (Get-Date).AddSeconds(`$nextSeconds)
+        `$vbsPath = "`$env:TEMP\PSTimer_`$timerId.vbs"
+        `$nextAction = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument `"`$vbsPath`"
+        `$nextTriggerObj = New-ScheduledTaskTrigger -Once -At `$nextTrigger
+        `$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -Hidden
 
-    `$registered = `$false
-    try {
-        Register-ScheduledTask -TaskName `$nextTaskName -Action `$nextAction -Trigger `$nextTriggerObj -Settings `$settings -Force -ErrorAction Stop | Out-Null
-        `$registered = `$true
-    } catch {
+        `$registered = `$false
         try {
             Register-ScheduledTask -TaskName `$nextTaskName -Action `$nextAction -Trigger `$nextTriggerObj -Settings `$settings -Force -ErrorAction Stop | Out-Null
             `$registered = `$true
         } catch {
-            "`$(Get-Date -Format 'o') ERROR re-registering task: `$(`$_.Exception.Message)" | Add-Content -LiteralPath `$logFile -Force
+            try {
+                Register-ScheduledTask -TaskName `$nextTaskName -Action `$nextAction -Trigger `$nextTriggerObj -Settings `$settings -Force -ErrorAction Stop | Out-Null
+                `$registered = `$true
+            } catch {
+                "`$(Get-Date -Format 'o') ERROR re-registering task: `$(`$_.Exception.Message)" | Add-Content -LiteralPath `$logFile -Force
+            }
+        }
+
+        if (`$registered) {
+            `$timer.CurrentPhase = `$nextPhaseIdx
+            `$timer.PhaseLabel = `$nextLabel
+            `$timer.Seconds = `$nextSeconds
+            `$timer.Message = `$nextLabel
+            `$timer.StartTime = (Get-Date).ToString('o')
+            `$timer.EndTime = (Get-Date).AddSeconds(`$nextSeconds).ToString('o')
+            `$timer.State = 'Running'
+            `$timer.TaskName = `$nextTaskName
+            Write-TimerDataFile -Items `$timers
+            if (`$currentTaskName) {
+                Unregister-ScheduledTask -TaskName `$currentTaskName -Confirm:`$false -ErrorAction SilentlyContinue
+            }
+        } else {
+            `$timer.State = 'Paused'
+            `$timer | Add-Member -NotePropertyName 'RemainingSeconds' -NotePropertyValue `$nextSeconds -Force
+            `$timer.TaskName = `$null
+            Write-TimerDataFile -Items `$timers
         }
     }
 } else {
-    # All phases done
     `$timer.State = 'Completed'
     `$timer.CurrentPhase = `$totalPhases
     `$timer.TaskName = `$null
+    Write-TimerDataFile -Items `$timers
 
-    ConvertTo-Json -InputObject `$timers -Depth 10 | Set-Content -LiteralPath `$dataFile -Force
-
-    Unregister-ScheduledTask -TaskName `$currentTaskName -Confirm:`$false -ErrorAction SilentlyContinue
+    if (`$currentTaskName) {
+        Unregister-ScheduledTask -TaskName `$currentTaskName -Confirm:`$false -ErrorAction SilentlyContinue
+    }
     Remove-Item -LiteralPath "`$env:TEMP\PSTimer_`$timerId.ps1" -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath "`$env:TEMP\PSTimer_`$timerId.vbs" -Force -ErrorAction SilentlyContinue
 }
@@ -1933,26 +2116,10 @@ switch (`$notifyType) {
 }
 "@
 
-    # Write script to temp file
-    $scriptPath = Join-Path $env:TEMP "PSTimer_$($Timer.Id).ps1"
-    $script | Set-Content -LiteralPath $scriptPath -Force -Encoding UTF8
+    $null = Write-TimerFireScriptFile -TimerId $Timer.Id -ScriptBody $script
+    $vbsPath = Write-TimerVbsWrapperFile -TimerId $Timer.Id
 
-    # Create VBS wrapper for truly invisible execution
-    $vbsPath = Join-Path $env:TEMP "PSTimer_$($Timer.Id).vbs"
-    $vbsScript = 'Set WshShell = CreateObject("WScript.Shell")' + [char]13 + [char]10 + `
-        'WshShell.Run "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ""' + $scriptPath + '""", 0, False' + [char]13 + [char]10 + `
-        'Set WshShell = Nothing'
-    $vbsScript | Set-Content -LiteralPath $vbsPath -Force -Encoding Ascii
-
-    # Remove any existing task with same name
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-
-    # Create scheduled task (completely hidden - uses VBS wrapper)
-    $action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$vbsPath`""
-    $trigger = New-ScheduledTaskTrigger -Once -At $triggerTime
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -Hidden
-
-    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
+    Register-TimerScheduledTaskAsync -TimerId $Timer.Id -TaskName $taskName -TriggerTime $triggerTime -VbsPath $vbsPath
     $Timer | Add-Member -NotePropertyName 'TaskName' -NotePropertyValue $taskName -Force
 }
 # endregion Timer-Sequence.ps1
@@ -2012,6 +2179,9 @@ function Show-TimerHelp {
                 @{ Type='raw'; Text='  silent No notification at all' }
                 @{ Type='raw'; Text='' }
                 @{ Type='raw'; Text='  Default: config.example.ps1 or config.ps1 -> TimerDefaults.Notify' }
+                @{ Type='raw'; Text='' }
+                @{ Type='raw'; Text='  After start: TimerDefaults.AfterStart = none | watch | list' }
+                @{ Type='raw'; Text='    none  confirmation only  |  watch  tw <id>  |  list  tl -w' }
             )
         }
     )
@@ -2031,6 +2201,8 @@ function Timer {
     .PARAMETER Notify
         Notification type: popup (default), toast, sound, silent.
         Override default in config.ps1 / config.example.ps1 TimerDefaults.Notify.
+    .PARAMETER AfterStart
+        After start: none, watch (tw), list (tl -w). Overrides TimerDefaults.AfterStart.
     .EXAMPLE
         t 25m
         t 30m Water
@@ -2045,7 +2217,9 @@ function Timer {
         [Parameter(Position=1)][Alias('m')][string]$Message = "Time is up!",
         [Parameter(Position=2)][Alias('r')][int]$Repeat = 1,
         [ValidateSet('popup', 'toast', 'sound', 'silent')]
-        [string]$Notify = $null
+        [string]$Notify = $null,
+        [ValidateSet('none', 'watch', 'list')]
+        [string]$AfterStart = $null
     )
 
     # Show help if no time provided
@@ -2056,7 +2230,7 @@ function Timer {
 
     # Check if this is a sequence pattern or preset
     if (Test-TimerSequence -Pattern $Time) {
-        Start-SequenceTimer -Pattern $Time -Notify $Notify
+        Start-SequenceTimer -Pattern $Time -Notify $Notify -AfterStart $AfterStart
         return
     }
 
@@ -2120,6 +2294,8 @@ function Timer {
     Write-Host "  Notify:   " -ForegroundColor Gray -NoNewline
     Write-Host $notificationType -ForegroundColor Green
     Write-Host ""
+
+    Invoke-TimerAfterStart -TimerId $id -AfterStart $AfterStart
 }
 
 function Start-SequenceTimer {
@@ -2130,10 +2306,13 @@ function Start-SequenceTimer {
         Sequence pattern string or preset name.
     .PARAMETER Notify
         Notification type: popup (default), toast, sound, silent.
+    .PARAMETER AfterStart
+        After start: none, watch (tw), list (tl -w). Overrides TimerDefaults.AfterStart.
     #>
     param(
         [string]$Pattern,
-        [string]$Notify = $null
+        [string]$Notify = $null,
+        [string]$AfterStart = $null
     )
 
     $originalPattern = $Pattern
@@ -2169,6 +2348,8 @@ function Start-SequenceTimer {
     $firstPhase = $phases[0]
     $endTime = $now.AddSeconds($firstPhase.Seconds)
     Write-SequenceTimerConfirmation -Id $id -OriginalPattern $originalPattern -Summary $summary -PhaseCount $phases.Count -FirstPhase $firstPhase -EndTime $endTime
+
+    Invoke-TimerAfterStart -TimerId $id -AfterStart $AfterStart
 }
 
 function Timer-List {

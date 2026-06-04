@@ -43,7 +43,7 @@ t "(30m 'long break')x1"
 
 ## Preset names
 
-If the string matches a preset key in `src/BuiltInPresets.ps1` (or your `config.ps1` overrides), it expands to that preset's pattern before parsing.
+If the string matches a preset key in `Config.Presets` (`config.example.ps1` or `config.ps1`), it expands to that preset's pattern before parsing.
 
 ## Parser rules
 

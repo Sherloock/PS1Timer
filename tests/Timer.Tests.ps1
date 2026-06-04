@@ -8,11 +8,11 @@ BeforeAll {
     if (Test-Path -LiteralPath $exampleConfig) {
         . $exampleConfig
     }
-    . "$ModuleRoot\src\BuiltInPresets.ps1"
     . "$ModuleRoot\src\TimerHelpers.ps1"
     . "$ModuleRoot\src\Timer.ps1"
 
     $script:TimerDataFile = "$TestDrive\ps-timers.json"
+    $script:TimerForceSyncRegister = $true
 }
 
 # ============================================================================
@@ -518,5 +518,77 @@ Describe "Show-TimerWatchDisplay" {
 
         Assert-MockCalled -CommandName Get-TimerWatchCompletedContent -Times 0 -Exactly
         Assert-MockCalled -CommandName Get-TimerDataIfChanged -ParameterFilter { $Force } -Times 1 -Exactly
+    }
+}
+
+Describe "Timer scheduled task helpers" {
+    It "VBS wrapper uses pwsh.exe and Chr(34) quoting for spaced paths" {
+        $savedPwsh = $script:PS1TimerPwsh
+        try {
+            $script:PS1TimerPwsh = 'C:\Program Files\PowerShell\7\pwsh.exe'
+            $vbs = Get-TimerVbsWrapperScript -Ps1Path 'C:\Users\GMK150-B\AppData\Local\Temp\PSTimer_2.ps1'
+            $vbs | Should -Match 'pwsh\.exe'
+            $vbs | Should -Not -Match 'powershell\.exe'
+            $vbs | Should -Match 'Chr\(34\)'
+            $vbs | Should -Not -Match 'WshShell\.Run "C:\\Program'
+        }
+        finally {
+            $script:PS1TimerPwsh = $savedPwsh
+        }
+    }
+
+    It "Get-TimerAfterStartAction returns config default and override" {
+        Get-TimerAfterStartAction | Should -Be 'none'
+        Get-TimerAfterStartAction -Override 'watch' | Should -Be 'watch'
+    }
+
+    It "Sync-TimerData skips Get-ScheduledTask when end time is far in the future" {
+        Mock Get-ScheduledTask { throw 'should not be called' }
+        $future = (Get-Date).AddMinutes(30).ToString('o')
+        $timers = @(
+            [PSCustomObject]@{
+                Id = '1'; State = 'Running'; EndTime = $future; Seconds = 1800
+                TaskName = 'PSTimer_1_abcdef01'; Duration = '30m'; Message = 'x'
+                StartTime = (Get-Date).ToString('o')
+                RepeatTotal = 1; RepeatRemaining = 0; CurrentRun = 1
+                IsSequence = $false
+            }
+        )
+        Mock Get-TimerData { return $timers }
+        { Sync-TimerData } | Should -Not -Throw
+        Assert-MockCalled Get-ScheduledTask -Times 0 -Exactly
+    }
+}
+
+Describe "Sequence phase advance (JSON)" {
+    BeforeAll {
+        Mock Register-ScheduledTask { }
+        Mock Unregister-ScheduledTask { }
+    }
+
+    BeforeEach {
+        if (Test-Path $script:TimerDataFile) { Remove-Item $script:TimerDataFile }
+    }
+
+    It "starts sequence with multiple phases in JSON" {
+        $phases = @(ConvertFrom-TimerSequence -Pattern '(10s a, 10s b)x1')
+        $summary = Get-SequenceSummary -Phases $phases
+        $id = '9'
+        $now = Get-Date
+        $timer = New-SequenceTimerFromPhases -Id $id -OriginalPattern 'test' -Phases $phases -Summary $summary -Now $now -NotifyType 'silent'
+        Save-TimerData -Timers @($timer)
+
+        $saved = @(Get-TimerData)
+        $saved[0].IsSequence | Should -BeTrue
+        $saved[0].TotalPhases | Should -Be 2
+        $saved[0].CurrentPhase | Should -Be 0
+        @($saved[0].Phases).Count | Should -Be 2
+    }
+
+    It "coerces single-object Phases array when advancing index" {
+        $singlePhase = [PSCustomObject]@{ Seconds = 5; Label = 'only'; Duration = '5s' }
+        $phases = @($singlePhase)
+        $phases[0].Seconds | Should -Be 5
+        @($phases).Count | Should -Be 1
     }
 }

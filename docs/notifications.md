@@ -20,8 +20,9 @@ To customize, copy to `config.ps1` and edit:
 ```powershell
 $global:Config = @{
     TimerDefaults = @{
-        Notify    = 'popup'    # popup | toast | sound | silent
-        SoundFile = $null      # e.g. 'C:\sounds\alarm.wav'
+        Notify     = 'popup'    # popup | toast | sound | silent
+        SoundFile  = $null      # e.g. 'C:\sounds\alarm.wav'
+        AfterStart = 'none'     # none | watch | list
     }
 }
 ```
