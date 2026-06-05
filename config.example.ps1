@@ -12,11 +12,17 @@
 $global:Config = @{
     # TimerDefaults — applied to every new timer unless overridden per command
     TimerDefaults = @{
-        # Notification: popup | toast | sound | silent
-        Notify = 'popup'
+        # Notification: popup | toast | sound | silent | webhook
+        Notify = 'sound'
+
+        # Default named webhook when Notify = webhook (key from Webhooks below)
+        Webhook = $null
 
         # Optional .wav for sound mode (null = console beep)
         SoundFile = $null
+
+        # UI theme — name from Palettes below (default | minimal | vibrant | monochrome | your own)
+        Theme = 'default'
 
         # After start: none | watch | list
         #   none  — show confirmation only (default)
@@ -26,6 +32,68 @@ $global:Config = @{
 
         # Skip "PS1Timer loaded" message on import (faster profile load)
         QuietLoad = $false
+    }
+
+    # Palettes — UI color themes (TimerDefaults.Theme picks one by name)
+    #
+    # Each role uses a named color: cyan, green, yellow, red, magenta, white, gray, darkgray
+    # plus bright variants (brightcyan, brightgreen, brightyellow, brightred, brightmagenta, brightwhite).
+    # Copy a block, rename the key, set Theme to that name. Description is for you only.
+    Palettes = @{
+        default = @{
+            Description  = 'Balanced colors for everyday use'
+            Primary      = 'cyan'       # titles, headers, timer IDs, progress bar
+            PrimaryMuted = 'cyan'       # underlines beneath titles
+            Text         = 'white'      # values, message text
+            Muted        = 'darkgray'   # dim labels, borders, hints
+            Success      = 'green'      # running, done, progress OK
+            Warning      = 'yellow'     # remaining time, paused, countdown
+            Danger       = 'red'        # errors, critical/low time
+            Accent       = 'magenta'    # repeats, sequence phases
+            Selected     = 'cyan'       # inverted row in picker menus
+        }
+        minimal = @{
+            Description  = 'Low-contrast gray palette for busy or dim screens'
+            Primary      = 'darkgray'
+            PrimaryMuted = 'darkgray'
+            Text         = 'white'
+            Muted        = 'darkgray'
+            Success      = 'white'
+            Warning      = 'darkgray'
+            Danger       = 'darkgray'
+            Accent       = 'darkgray'
+            Selected     = 'darkgray'
+        }
+        vibrant = @{
+            Description  = 'Bright colors for high-contrast displays'
+            Primary      = 'brightcyan'
+            PrimaryMuted = 'cyan'
+            Text         = 'brightwhite'
+            Muted        = 'darkgray'
+            Success      = 'brightgreen'
+            Warning      = 'brightyellow'
+            Danger       = 'brightred'
+            Accent       = 'brightmagenta'
+            Selected     = 'cyan'
+        }
+        monochrome = @{
+            Description  = 'White and gray only — no hue'
+            Primary      = 'white'
+            PrimaryMuted = 'darkgray'
+            Text         = 'brightwhite'
+            Muted        = 'darkgray'
+            Success      = 'white'
+            Warning      = 'darkgray'
+            Danger       = 'white'
+            Accent       = 'darkgray'
+            Selected     = 'darkgray'
+        }
+    }
+
+    # Named webhook URLs — use with -Notify webhook -Webhook "name"
+    Webhooks = @{
+        # 'discord-main' = 'https://discord.com/api/webhooks/...'
+        # 'ntfy-phone'   = 'https://ntfy.sh/my-topic'
     }
 
     # Presets — sequence patterns by name (t pomodoro, tpre)
@@ -76,6 +144,7 @@ $global:Config = @{
         }
         'tabata' = @{
             Pattern     = '(20s work, 10s rest)x8'
+            Notify      = 'sound'
             Description = 'Tabata HIIT interval (4 minutes)'
         }
         'cooking-pasta' = @{

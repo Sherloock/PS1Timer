@@ -14,6 +14,7 @@ if (Test-Path -LiteralPath $configPath) {
 }
 
 . (Join-Path $script:PS1TimerRoot 'src\TimerHelpers.ps1')
+Assert-TimerConfig
 . (Join-Path $script:PS1TimerRoot 'src\Timer.ps1')
 
 $quietLoad = $false

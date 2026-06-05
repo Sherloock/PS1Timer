@@ -165,13 +165,60 @@ Describe "Get-AnsiColors" {
         $colors = Get-AnsiColors
         $colors | Should -BeOfType [hashtable]
         $colors.Keys | Should -Contain "Reset"
-        $colors.Keys | Should -Contain "Cyan"
-        $colors.Keys | Should -Contain "Green"
+        $colors.Keys | Should -Contain "Primary"
+        $colors.Keys | Should -Contain "Success"
     }
 
     It "returns ANSI escape sequences" {
         $colors = Get-AnsiColors
         $colors.Reset | Should -Match '\x1b\['
+    }
+
+    It "uses Config.Palettes theme colors" {
+        $saved = $global:Config
+        try {
+            $global:Config = @{
+                TimerDefaults = @{ Theme = 'custom' }
+                Palettes      = @{
+                    custom = @{
+                        Description  = 'Test palette'
+                        Primary      = 'brightcyan'
+                        PrimaryMuted = 'cyan'
+                        Text         = 'brightwhite'
+                        Muted        = 'darkgray'
+                        Success      = 'brightgreen'
+                        Warning      = 'brightyellow'
+                        Danger       = 'brightred'
+                        Accent       = 'brightmagenta'
+                        Selected     = 'cyan'
+                    }
+                }
+            }
+            $colors = Get-AnsiColors
+            $colors.Theme | Should -Be 'custom'
+            $colors.Primary | Should -Be "$([char]27)[96m"
+        }
+        finally {
+            $global:Config = $saved
+        }
+    }
+}
+
+Describe "Resolve-TimerPaletteColors" {
+    It "converts named colors to escape sequences" {
+        $resolved = Resolve-TimerPaletteColors -PaletteEntry @{
+            Primary      = 'cyan'
+            PrimaryMuted = 'cyan'
+            Text         = 'white'
+            Muted        = 'darkgray'
+            Success      = 'green'
+            Warning      = 'yellow'
+            Danger       = 'red'
+            Accent       = 'magenta'
+            Selected     = 'cyan'
+        }
+        $resolved.Success | Should -Be "$([char]27)[32m"
+        $resolved.Selected | Should -Be "$([char]27)[30;46m"
     }
 }
 
@@ -283,5 +330,39 @@ Describe "Module configuration loading" {
         finally {
             $global:Config = $saved
         }
+    }
+}
+
+Describe "Resolve-TimerWebhookUrl" {
+    It "resolves named webhook from config" {
+        $saved = $global:Config
+        try {
+            $global:Config = @{
+                Webhooks = @{ 'discord-main' = 'https://example.com/hook' }
+            }
+            Resolve-TimerWebhookUrl -Name 'discord-main' | Should -Be 'https://example.com/hook'
+            Resolve-TimerWebhookUrl -Name 'missing' | Should -BeNullOrEmpty
+        }
+        finally {
+            $global:Config = $saved
+        }
+    }
+}
+
+Describe "Parse-TimerAtTime" {
+    It "parses future HH:mm today" {
+        $now = Get-Date '2026-06-05T10:00:00'
+        $result = Parse-TimerAtTime -At '14:30' -Now $now
+        $result.Hour | Should -Be 14
+        $result.Minute | Should -Be 30
+    }
+
+    It "returns null for past time today" {
+        $now = Get-Date '2026-06-05T15:00:00'
+        Parse-TimerAtTime -At '14:30' -Now $now | Should -BeNullOrEmpty
+    }
+
+    It "returns null for invalid format" {
+        Parse-TimerAtTime -At '2:30pm' | Should -BeNullOrEmpty
     }
 }

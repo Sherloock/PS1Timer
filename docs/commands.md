@@ -37,7 +37,7 @@ tw           # picker if multiple timers
 tw 1         # watch timer id 1
 ```
 
-Shows progress bar, remaining time, and phase timeline for sequences. Press any key to exit.
+Shows progress bar, remaining time, **Final end** for sequences, and a phase timeline with `@ HH:mm:ss` end times. Press any key to exit.
 
 ## Timer-Presets (`tpre`)
 

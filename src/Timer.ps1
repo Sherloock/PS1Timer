@@ -6,6 +6,7 @@
 
 # Timer data file path (shared across timer functions)
 $script:TimerDataFile = Join-Path $env:TEMP "ps-timers.json"
+$script:TimerHistoryFile = Join-Path $env:TEMP "ps-timer-history.json"
 # Cache for watch mode optimization
 $script:TimerDataCache = $null
 $script:TimerDataCacheTime = [DateTime]::MinValue
@@ -151,6 +152,9 @@ function Save-TimerData {
             if ($t.PSObject.Properties.Name -contains 'NotifyType' -and $t.NotifyType) {
                 $obj | Add-Member -NotePropertyName 'NotifyType' -NotePropertyValue $t.NotifyType
             }
+            if ($t.PSObject.Properties.Name -contains 'WebhookName' -and $t.WebhookName) {
+                $obj | Add-Member -NotePropertyName 'WebhookName' -NotePropertyValue $t.WebhookName
+            }
 
             if ($t.IsSequence) {
                 $obj | Add-Member -NotePropertyName 'SequencePattern' -NotePropertyValue $t.SequencePattern
@@ -172,6 +176,78 @@ function Save-TimerData {
     $script:TimerDataCacheTime = if ($fileInfo) { $fileInfo.LastWriteTime } else { Get-Date }
 }
 
+function Invoke-TimerFireScriptRecovery {
+    <#
+    .SYNOPSIS
+        Runs the timer fire script when a scheduled task failed to complete the timer.
+    #>
+    param([PSCustomObject]$Timer)
+
+    $scriptPath = Join-Path $env:TEMP "PSTimer_$($Timer.Id).ps1"
+    if (-not (Test-Path -LiteralPath $scriptPath)) {
+        return $false
+    }
+
+    $log = Join-Path $env:TEMP "PSTimer_$($Timer.Id).log"
+    try {
+        $null = [scriptblock]::Create((Get-Content -LiteralPath $scriptPath -Raw))
+    }
+    catch {
+        "$(Get-Date -Format 'o') WARN fire script parse, regenerating: $($_.Exception.Message)" | Add-Content -LiteralPath $log -Force
+        if ($Timer.IsSequence) {
+            Start-SequenceTimerJob -Timer $Timer
+        }
+        else {
+            $webhookUrl = if ($Timer.WebhookName) { Resolve-TimerWebhookUrl -Name $Timer.WebhookName } else { $null }
+            $notify = if ($Timer.NotifyType) { $Timer.NotifyType } else { 'popup' }
+            Start-TimerJob -Timer $Timer -Notify $notify -WebhookUrl $webhookUrl
+        }
+        try {
+            $null = [scriptblock]::Create((Get-Content -LiteralPath $scriptPath -Raw))
+        }
+        catch {
+            "$(Get-Date -Format 'o') ERROR fire script still invalid: $($_.Exception.Message)" | Add-Content -LiteralPath $log -Force
+            return $false
+        }
+    }
+
+    try {
+        & $scriptPath
+        return $true
+    }
+    catch {
+        "$(Get-Date -Format 'o') ERROR fire script recovery: $($_.Exception.Message)" | Add-Content -LiteralPath $log -Force
+        return $false
+    }
+}
+
+function Remove-StalePSTimerScheduledTasks {
+    <#
+    .SYNOPSIS
+        Deletes PSTimer_* tasks that are not referenced by any timer record.
+    #>
+    $activeNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($t in @(Get-TimerData)) {
+        if ($t.TaskName) { [void]$activeNames.Add([string]$t.TaskName) }
+    }
+
+    $existing = Get-PSTimerScheduledTaskNames -ForceRefresh
+    if ($null -eq $existing) { return 0 }
+
+    $removed = 0
+    foreach ($name in $existing) {
+        if ($activeNames.Contains($name)) { continue }
+        Remove-TimerScheduledTaskByName -TaskName $name
+        $removed++
+    }
+
+    if ($removed -gt 0) {
+        Clear-TimerScheduledTaskNameCache
+    }
+
+    return $removed
+}
+
 function Sync-TimerData {
     <#
     .SYNOPSIS
@@ -186,7 +262,7 @@ function Sync-TimerData {
     $taskNames = $null
 
     foreach ($timer in $timers) {
-        if ($timer.State -ne 'Running') { continue }
+        if ($timer.State -ne 'Running' -and $timer.State -ne 'Scheduled') { continue }
 
         try {
             $endTime = [DateTime]::Parse($timer.EndTime)
@@ -197,6 +273,18 @@ function Sync-TimerData {
             $timer | Add-Member -NotePropertyName 'RemainingSeconds' -NotePropertyValue $timer.Seconds -Force
             $changed = $true
             continue
+        }
+
+        if ($remaining -le -10) {
+            $null = Invoke-TimerFireScriptRecovery -Timer $timer
+            $refreshed = Find-TimerById -Timers @(Get-TimerData -Force) -Id $timer.Id
+            if ($refreshed -and $refreshed.State -ne $timer.State) {
+                $timer.State = $refreshed.State
+                $changed = $true
+            }
+            if ($timer.State -ne 'Running' -and $timer.State -ne 'Scheduled') {
+                continue
+            }
         }
 
         # Trust JSON while the phase still has time left (avoids scheduler lookup per timer)
@@ -220,6 +308,11 @@ function Sync-TimerData {
 
     if ($changed) {
         Save-TimerData -Timers $timers
+        $timers = @(Get-TimerData -Force)
+    }
+
+    if (-not $script:TimerForceSyncRegister) {
+        $null = Remove-StalePSTimerScheduledTasks
     }
 
     return $timers
@@ -300,7 +393,7 @@ function Get-TimerForWatch {
         [array]$Timers,
         [string]$Id
     )
-    $active = @($Timers | Where-Object { $_.State -eq 'Running' })
+    $active = @($Timers | Where-Object { $_.State -eq 'Running' -or $_.State -eq 'Scheduled' })
     if ($active.Count -eq 0) {
         return @{ Error = 'NoActive' }
     }
@@ -318,7 +411,7 @@ function Get-TimerForWatch {
     if (-not $t) {
         return @{ Error = 'NotFound'; Id = $Id }
     }
-    if ($t.State -ne 'Running') {
+    if ($t.State -ne 'Running' -and $t.State -ne 'Scheduled') {
         return @{ Error = 'NotRunning'; Id = $Id; State = $t.State }
     }
     return @{ Timer = $t }
@@ -429,20 +522,37 @@ function Get-AnsiColors {
         Returns a hashtable of ANSI color escape codes for console output.
     #>
     $esc = [char]27
+    $theme = 'default'
+    if ($global:Config -and $global:Config.TimerDefaults -and $global:Config.TimerDefaults.Theme) {
+        $theme = $global:Config.TimerDefaults.Theme.ToLower()
+    }
+
+    $palettes = if ($global:Config -and $global:Config.Palettes) {
+        $global:Config.Palettes
+    } else {
+        Get-DefaultTimerPalettes
+    }
+
+    $paletteEntry = if ($palettes.ContainsKey($theme)) { $palettes[$theme] } else { $palettes['default'] }
+    if (-not $paletteEntry) {
+        $paletteEntry = (Get-DefaultTimerPalettes)['default']
+    }
+    $palette = Resolve-TimerPaletteColors -PaletteEntry $paletteEntry
     return @{
-        Esc        = $esc
-        Reset      = "$esc[0m"
-        Bold       = "$esc[1m"
-        Dim        = "$esc[2m"
-        Cyan       = "$esc[36m"
-        DarkCyan   = "$esc[36m"
-        Green      = "$esc[32m"
-        Yellow     = "$esc[33m"
-        Red        = "$esc[31m"
-        Magenta    = "$esc[35m"
-        White      = "$esc[97m"
-        Gray       = "$esc[90m"
-        InvertCyan = "$esc[30;46m"
+        Esc          = $esc
+        Reset        = "$esc[0m"
+        Bold         = "$esc[1m"
+        Dim          = "$esc[2m"
+        Primary      = $palette.Primary
+        PrimaryMuted = $palette.PrimaryMuted
+        Text         = $palette.Text
+        Muted        = $palette.Muted
+        Success      = $palette.Success
+        Warning      = $palette.Warning
+        Danger       = $palette.Danger
+        Accent       = $palette.Accent
+        Selected     = $palette.Selected
+        Theme        = $theme
     }
 }
 
@@ -475,6 +585,7 @@ function Get-TimerStateColor {
 
     $colorName = switch ($State) {
         'Running'   { 'Green' }
+        'Scheduled' { 'Cyan' }
         'Completed' { 'DarkGray' }
         'Paused'    { 'Yellow' }
         'Lost'      { 'Red' }
@@ -484,11 +595,12 @@ function Get-TimerStateColor {
     if ($Ansi) {
         $colors = Get-AnsiColors
         $result = switch ($colorName) {
-            'Green'    { $colors.Green }
-            'DarkGray' { $colors.Gray }
-            'Yellow'   { $colors.Yellow }
-            'Red'      { $colors.Red }
-            default    { $colors.Gray }
+            'Green'    { $colors.Success }
+            'Cyan'     { $colors.Primary }
+            'DarkGray' { $colors.Muted }
+            'Yellow'   { $colors.Warning }
+            'Red'      { $colors.Danger }
+            default    { $colors.Muted }
         }
         return $result
     }
@@ -505,6 +617,18 @@ function Get-TimerProgress {
 
     if ($Timer.State -eq 'Completed') {
         return [double]100
+    }
+
+    if ($Timer.State -eq 'Scheduled') {
+        $now = Get-Date
+        $startTime = [DateTime]::Parse($Timer.StartTime)
+        $endTime = [DateTime]::Parse($Timer.EndTime)
+        if ($now -lt $startTime) { return [double]0 }
+        if ($now -ge $endTime) { return [double]100 }
+        $elapsed = ($now - $startTime).TotalSeconds
+        $total = ($endTime - $startTime).TotalSeconds
+        if ($total -le 0) { return [double]0 }
+        return [math]::Min(100.0, [math]::Max(0.0, ($elapsed / $total) * 100))
     }
 
     if ($Timer.State -eq 'Paused') {
@@ -529,13 +653,100 @@ function Get-TimerProgress {
     return $percent
 }
 
+function Get-TimerFinalEndTime {
+    <#
+    .SYNOPSIS
+        Returns when the timer fully completes (all phases or repeats), not just the current run/phase.
+    #>
+    param(
+        [PSCustomObject]$Timer,
+        [DateTime]$Now = (Get-Date)
+    )
+
+    if ($Timer.IsSequence) {
+        $startTime = [DateTime]::Parse($Timer.StartTime)
+        if ($Timer.State -eq 'Scheduled' -and $Now -lt $startTime) {
+            return $startTime.AddSeconds([int]$Timer.TotalSeconds)
+        }
+
+        $endTime = [DateTime]::Parse($Timer.EndTime)
+        $futureSeconds = 0
+        if ($Timer.Phases) {
+            $currentPhase = [int]$Timer.CurrentPhase
+            for ($i = $currentPhase + 1; $i -lt $Timer.Phases.Count; $i++) {
+                $futureSeconds += [int]$Timer.Phases[$i].Seconds
+            }
+        }
+        return $endTime.AddSeconds($futureSeconds)
+    }
+
+    $runSeconds = [int]$Timer.Seconds
+    $repeatRemaining = if ($null -ne $Timer.RepeatRemaining) { [int]$Timer.RepeatRemaining } else { 0 }
+    $repeatTotal = if ($Timer.RepeatTotal -gt 0) { [int]$Timer.RepeatTotal } else { 1 }
+
+    if ($Timer.State -eq 'Scheduled') {
+        $startTime = [DateTime]::Parse($Timer.StartTime)
+        if ($Now -lt $startTime) {
+            return $startTime.AddSeconds($runSeconds * $repeatTotal)
+        }
+    }
+
+    $endTime = [DateTime]::Parse($Timer.EndTime)
+    return $endTime.AddSeconds($repeatRemaining * $runSeconds)
+}
+
+function Get-SequencePhaseEndTime {
+    <#
+    .SYNOPSIS
+        Returns when a sequence phase ends (by phase index).
+    #>
+    param(
+        [PSCustomObject]$Timer,
+        [int]$PhaseIndex,
+        [DateTime]$Now = (Get-Date)
+    )
+
+    if (-not $Timer.Phases -or $PhaseIndex -lt 0 -or $PhaseIndex -ge $Timer.Phases.Count) {
+        return $null
+    }
+
+    $currentPhase = [int]$Timer.CurrentPhase
+    $startTime = [DateTime]::Parse($Timer.StartTime)
+    $endTime = [DateTime]::Parse($Timer.EndTime)
+
+    if ($Timer.State -eq 'Scheduled' -and $Now -lt $startTime) {
+        $elapsed = 0
+        for ($i = 0; $i -le $PhaseIndex; $i++) {
+            $elapsed += [int]$Timer.Phases[$i].Seconds
+        }
+        return $startTime.AddSeconds($elapsed)
+    }
+
+    if ($PhaseIndex -eq $currentPhase) {
+        return $endTime
+    }
+    if ($PhaseIndex -gt $currentPhase) {
+        $futureSeconds = 0
+        for ($i = $currentPhase + 1; $i -le $PhaseIndex; $i++) {
+            $futureSeconds += [int]$Timer.Phases[$i].Seconds
+        }
+        return $endTime.AddSeconds($futureSeconds)
+    }
+
+    $pastSeconds = 0
+    for ($i = $PhaseIndex + 1; $i -lt $currentPhase; $i++) {
+        $pastSeconds += [int]$Timer.Phases[$i].Seconds
+    }
+    return $startTime.AddSeconds(-$pastSeconds)
+}
+
 function Test-TimerIsActiveDisplay {
     <#
     .SYNOPSIS
         Returns whether the timer state should show remaining time and ends-at.
     #>
     param([string]$State)
-    return ($State -eq 'Running' -or $State -eq 'Paused' -or $State -eq 'Lost')
+    return ($State -eq 'Running' -or $State -eq 'Scheduled' -or $State -eq 'Paused' -or $State -eq 'Lost')
 }
 
 function Get-TimerListRowColorsForState {
@@ -546,6 +757,9 @@ function Get-TimerListRowColorsForState {
     param([string]$State)
     if ($State -eq 'Running') {
         return @{ RemainingColor = 'Yellow'; EndsColor = 'Green' }
+    }
+    if ($State -eq 'Scheduled') {
+        return @{ RemainingColor = 'Cyan'; EndsColor = 'Cyan' }
     }
     if ($State -eq 'Lost') {
         return @{ RemainingColor = 'DarkRed'; EndsColor = 'DarkGray' }
@@ -590,7 +804,19 @@ function Get-TimerListRowDisplayData {
 
     $showActive = Test-TimerIsActiveDisplay -State $Timer.State
     if ($showActive) {
-        if ($Timer.State -eq 'Running') {
+        if ($Timer.State -eq 'Scheduled') {
+            $startTime = [DateTime]::Parse($Timer.StartTime)
+            if ($Now -lt $startTime) {
+                $untilStart = $startTime - $Now
+                $remainingStr = 'in ' + (Format-RemainingTime -Remaining $untilStart)
+                $endsAtStr = $startTime.ToString('HH:mm:ss')
+                $progressStr = 'wait'
+            }
+            else {
+                $endsAtStr = $endTime.ToString('HH:mm:ss')
+            }
+        }
+        elseif ($Timer.State -eq 'Running') {
             $endsAtStr = $endTime.ToString('HH:mm:ss')
         }
         else {
@@ -641,10 +867,10 @@ function Get-TimerListWatchRowLine {
     )
     $row = Get-TimerListRowDisplayData -Timer $Timer -Now $Now
     $stateColor = Get-TimerStateColor -State $Timer.State -Ansi
-    $phaseColor = if ($Timer.IsSequence) { $Colors.Cyan } else { $Colors.Magenta }
+    $phaseColor = if ($Timer.IsSequence) { $Colors.Primary } else { $Colors.Accent }
     $id = $ColWidths.Id; $st = $ColWidths.State; $dur = $ColWidths.Duration
     $rem = $ColWidths.Remaining; $prog = $ColWidths.Progress; $end = $ColWidths.EndsAt; $ph = $ColWidths.Phase
-    return "  $($Colors.Cyan){0,-$id}$($Colors.Reset)${stateColor}{1,-$st}$($Colors.Reset)$($Colors.White){2,-$dur}$($Colors.Reset)$($Colors.Yellow){3,-$rem}$($Colors.Reset)$($Colors.Green){4,-$prog}$($Colors.Reset)$($Colors.Green){5,-$end}$($Colors.Reset)${phaseColor}{6,-$ph}$($Colors.Reset)$($Colors.Gray){7}$($Colors.Reset)" -f $Timer.Id, $Timer.State, $row.DurationStr, $row.RemainingStr, $row.ProgressStr, $row.EndsAtStr, $row.RepeatStr, $row.MsgDisplay
+    return "  $($Colors.Primary){0,-$id}$($Colors.Reset)${stateColor}{1,-$st}$($Colors.Reset)$($Colors.Text){2,-$dur}$($Colors.Reset)$($Colors.Warning){3,-$rem}$($Colors.Reset)$($Colors.Success){4,-$prog}$($Colors.Reset)$($Colors.Success){5,-$end}$($Colors.Reset)${phaseColor}{6,-$ph}$($Colors.Reset)$($Colors.Muted){7}$($Colors.Reset)" -f $Timer.Id, $Timer.State, $row.DurationStr, $row.RemainingStr, $row.ProgressStr, $row.EndsAtStr, $row.RepeatStr, $row.MsgDisplay
 }
 
 function Wait-OneSecondOrKeyPress {
@@ -668,6 +894,56 @@ function Wait-OneSecondOrKeyPress {
     return $false
 }
 
+function Format-TimerWatchRow {
+    <#
+    .SYNOPSIS
+        Formats a left-aligned label/value row for watch display.
+    #>
+    param(
+        [hashtable]$Colors,
+        [string]$Label,
+        [string]$Value,
+        [string]$ValueAnsi = $null
+    )
+    $valueCode = if ($ValueAnsi) { $ValueAnsi } else { $Colors.Text }
+    return '  ' + $Colors.Dim + ($Label.PadRight(11)) + $Colors.Reset + $valueCode + $Value + $Colors.Reset
+}
+
+function Get-TimerWatchSeparator {
+    param(
+        [hashtable]$Colors,
+        [int]$Width = 40
+    )
+    return '  ' + $Colors.Dim + ('-' * $Width) + $Colors.Reset
+}
+
+function Get-TimerWatchProgressBar {
+    param(
+        [hashtable]$Colors,
+        [double]$Percent,
+        [int]$Width = 32,
+        [switch]$Waiting
+    )
+    $barFull = [char]0x2588
+    $barEmpty = [char]0x2591
+    if ($Waiting) {
+        $filled = ''
+        $empty = [string]$barEmpty * $Width
+        $pct = 'wait'
+        $barColor = $Colors.Primary
+    }
+    else {
+        $filledCount = [int][math]::Floor(($Percent / 100) * $Width)
+        $emptyCount = [int]($Width - $filledCount)
+        $filled = [string]$barFull * $filledCount
+        $empty = [string]$barEmpty * $emptyCount
+        $inv = [System.Globalization.CultureInfo]::InvariantCulture
+        $pct = $Percent.ToString('0', $inv) + '%'
+        $barColor = Get-TimerProgressBarColor -Colors $Colors -Percent $Percent
+    }
+    return '  ' + $barColor + $filled + $Colors.Dim + $empty + $Colors.Reset + '  ' + $Colors.Bold + $pct + $Colors.Reset
+}
+
 function Get-TimerWatchCompletedContent {
     <#
     .SYNOPSIS
@@ -679,24 +955,32 @@ function Get-TimerWatchCompletedContent {
         [int]$TotalSeconds,
         [DateTime]$EndTime
     )
-    $barFull = [char]0x2588
-    $barWidth = 40
-    $fullBar = [string]$barFull * $barWidth
     $durStr = Format-Duration -Seconds $TotalSeconds
     $endStr = $EndTime.ToString('HH:mm:ss')
+    $c = $Colors
     $sb = [System.Text.StringBuilder]::new()
-    [void]$sb.AppendLine("")
-    [void]$sb.AppendLine($Colors.Green + $Colors.Bold + "  TIMER COMPLETED!" + $Colors.Reset)
-    [void]$sb.AppendLine($Colors.Cyan + "  ==================" + $Colors.Reset)
-    [void]$sb.AppendLine("")
-    [void]$sb.AppendLine($Colors.Gray + "  Message:  " + $Colors.White + $Message + $Colors.Reset)
-    [void]$sb.AppendLine($Colors.Gray + "  Duration: " + $Colors.White + $durStr + $Colors.Reset)
-    [void]$sb.AppendLine("")
-    [void]$sb.AppendLine("  " + $Colors.Green + $fullBar + $Colors.Reset + " " + $Colors.Bold + "100%" + $Colors.Reset)
-    [void]$sb.AppendLine("")
-    [void]$sb.AppendLine($Colors.Green + "  Finished at " + $endStr + $Colors.Reset)
-    [void]$sb.AppendLine("")
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('  ' + $c.Success + $c.Bold + 'DONE' + $c.Reset)
+    [void]$sb.AppendLine((Get-TimerWatchSeparator -Colors $c))
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine((Format-TimerWatchRow -Colors $c -Label 'Message' -Value $Message))
+    [void]$sb.AppendLine((Format-TimerWatchRow -Colors $c -Label 'Duration' -Value $durStr))
+    [void]$sb.AppendLine((Format-TimerWatchRow -Colors $c -Label 'Finished' -Value $endStr -ValueAnsi $c.Success))
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine((Get-TimerWatchProgressBar -Colors $c -Percent 100))
+    [void]$sb.AppendLine('')
     return $sb
+}
+
+function Get-TimerProgressBarColor {
+    param(
+        [hashtable]$Colors,
+        [double]$Percent
+    )
+    $remainingPct = 100 - $Percent
+    if ($remainingPct -le 10) { return $Colors.Danger }
+    if ($remainingPct -le 25) { return $Colors.Warning }
+    return $Colors.Success
 }
 
 function Get-TimerWatchRunningContent {
@@ -712,52 +996,80 @@ function Get-TimerWatchRunningContent {
         [TimeSpan]$Remaining,
         [string]$EndsAtFormatted
     )
-    $barFull = [char]0x2588
-    $barEmpty = [char]0x2591
-    $barWidth = 40
-    $filledCount = [int][math]::Floor(($Percent / 100) * $barWidth)
-    $emptyCount = [int]($barWidth - $filledCount)
-    $filledBar = [string]$barFull * $filledCount
-    $emptyBar = [string]$barEmpty * $emptyCount
-    $inv = [System.Globalization.CultureInfo]::InvariantCulture
-    $percentStr = $Percent.ToString("0.00", $inv) + "%"
     $remainingStr = Format-RemainingTime -Remaining $Remaining
+    $waiting = $false
     $c = $Colors
     $sb = [System.Text.StringBuilder]::new()
-    [void]$sb.AppendLine("")
+    [void]$sb.AppendLine('')
     $timerId = $Timer.Id
+
+    $titleLabel = if ($CurrentTimer.IsSequence) { 'SEQUENCE' } else { 'TIMER' }
+    [void]$sb.AppendLine('  ' + $c.Primary + $c.Bold + "$titleLabel [$timerId]" + $c.Reset)
+    [void]$sb.AppendLine((Get-TimerWatchSeparator -Colors $c))
+    [void]$sb.AppendLine('')
+
     if ($CurrentTimer.IsSequence) {
         $phaseNum = [int]$CurrentTimer.CurrentPhase + 1
-        $phaseLabel = $CurrentTimer.PhaseLabel
-        $seqTotal = Format-Duration -Seconds $CurrentTimer.TotalSeconds
-        $seqPhaseDur = Format-Duration -Seconds $CurrentTimer.Seconds
-        [void]$sb.AppendLine($c.Cyan + $c.Bold + "  SEQUENCE WATCH " + $c.White + "[" + $timerId + "]" + $c.Reset)
-        [void]$sb.AppendLine($c.Cyan + "  =====================" + $c.Reset)
-        [void]$sb.AppendLine("")
-        [void]$sb.AppendLine($c.Gray + "  Pattern:  " + $c.White + $CurrentTimer.SequencePattern + $c.Reset)
-        [void]$sb.AppendLine($c.Gray + "  Total:    " + $c.White + $seqTotal + $c.Reset)
-        [void]$sb.AppendLine("")
-        [void]$sb.AppendLine($c.Cyan + $c.Bold + "  Phase " + $phaseNum + "/" + $CurrentTimer.TotalPhases + ": " + $phaseLabel + $c.Reset)
-        [void]$sb.AppendLine($c.Gray + "  Duration: " + $c.White + $seqPhaseDur + $c.Reset)
-        [void]$sb.AppendLine($c.Gray + "  Ends at:  " + $c.Yellow + $EndsAtFormatted + $c.Reset)
+        $phaseTitle = "Phase $phaseNum of $($CurrentTimer.TotalPhases)"
+        [void]$sb.AppendLine((Format-TimerWatchRow -Colors $c -Label 'Phase' -Value $phaseTitle -ValueAnsi ($c.Text + $c.Bold)))
+        [void]$sb.AppendLine((Format-TimerWatchRow -Colors $c -Label 'Label' -Value $CurrentTimer.PhaseLabel))
+        $phaseDur = Format-Duration -Seconds $CurrentTimer.Seconds
+        [void]$sb.AppendLine((Format-TimerWatchRow -Colors $c -Label 'This phase' -Value $phaseDur))
     }
     else {
-        [void]$sb.AppendLine($c.Cyan + $c.Bold + "  TIMER WATCH " + $c.White + "[" + $timerId + "]" + $c.Reset)
-        [void]$sb.AppendLine($c.Cyan + "  ===================" + $c.Reset)
-        [void]$sb.AppendLine("")
-        [void]$sb.AppendLine($c.Gray + "  Message:  " + $c.White + $Timer.Message + $c.Reset)
+        [void]$sb.AppendLine((Format-TimerWatchRow -Colors $c -Label 'Message' -Value $Timer.Message -ValueAnsi ($c.Text + $c.Bold)))
         $msgDur = Format-Duration -Seconds $Timer.Seconds
-        [void]$sb.AppendLine($c.Gray + "  Duration: " + $c.White + $msgDur + $c.Reset)
-        [void]$sb.AppendLine($c.Gray + "  Ends at:  " + $c.Yellow + $EndsAtFormatted + $c.Reset)
+        [void]$sb.AppendLine((Format-TimerWatchRow -Colors $c -Label 'Duration' -Value $msgDur))
         if ($Timer.RepeatTotal -gt 1) {
-            $repStr = $CurrentTimer.CurrentRun.ToString() + "/" + $Timer.RepeatTotal.ToString()
-            [void]$sb.AppendLine($c.Gray + "  Repeat:   " + $c.White + $repStr + $c.Reset)
+            $repStr = "$($CurrentTimer.CurrentRun) of $($Timer.RepeatTotal)"
+            [void]$sb.AppendLine((Format-TimerWatchRow -Colors $c -Label 'Repeat' -Value $repStr -ValueAnsi $c.Accent))
         }
     }
-    [void]$sb.AppendLine("")
-    [void]$sb.AppendLine("  " + $c.Green + $filledBar + $c.Gray + $emptyBar + $c.Reset + " " + $c.Bold + $percentStr + $c.Reset)
-    [void]$sb.AppendLine("")
-    [void]$sb.AppendLine($c.Yellow + $c.Bold + "  Remaining: " + $remainingStr + $c.Reset)
+
+    $showFinalEnd = $CurrentTimer.IsSequence -or ([int]$CurrentTimer.RepeatTotal -gt 1)
+    $now = Get-Date
+
+    if ($CurrentTimer.State -eq 'Scheduled') {
+        $startTime = [DateTime]::Parse($CurrentTimer.StartTime)
+        if ($now -lt $startTime) {
+            $remainingStr = Format-RemainingTime -Remaining ($startTime - $now)
+            $waiting = $true
+            [void]$sb.AppendLine((Format-TimerWatchRow -Colors $c -Label 'Starts' -Value $startTime.ToString('HH:mm:ss') -ValueAnsi $c.Primary))
+            [void]$sb.AppendLine((Format-TimerWatchRow -Colors $c -Label 'Countdown' -Value $remainingStr -ValueAnsi ($c.Warning + $c.Bold)))
+            if ($showFinalEnd) {
+                $finalEndStr = (Get-TimerFinalEndTime -Timer $CurrentTimer -Now $now).ToString('HH:mm:ss')
+                [void]$sb.AppendLine((Format-TimerWatchRow -Colors $c -Label 'Final end' -Value $finalEndStr -ValueAnsi $c.Accent))
+            }
+        }
+    }
+
+    if (-not $waiting) {
+        if (-not $CurrentTimer.IsSequence) {
+            [void]$sb.AppendLine((Format-TimerWatchRow -Colors $c -Label 'Ends' -Value $EndsAtFormatted -ValueAnsi $c.Warning))
+        }
+        [void]$sb.AppendLine((Format-TimerWatchRow -Colors $c -Label 'Remaining' -Value $remainingStr -ValueAnsi ($c.Warning + $c.Bold)))
+        if ($CurrentTimer.IsSequence) {
+            $finalEndStr = (Get-TimerFinalEndTime -Timer $CurrentTimer -Now $now).ToString('HH:mm:ss')
+            [void]$sb.AppendLine((Format-TimerWatchRow -Colors $c -Label 'Final end' -Value $finalEndStr -ValueAnsi $c.Accent))
+        }
+        elseif ($showFinalEnd) {
+            $finalEndStr = (Get-TimerFinalEndTime -Timer $CurrentTimer -Now $now).ToString('HH:mm:ss')
+            if ($finalEndStr -ne $EndsAtFormatted) {
+                [void]$sb.AppendLine((Format-TimerWatchRow -Colors $c -Label 'Final end' -Value $finalEndStr -ValueAnsi $c.Accent))
+            }
+        }
+    }
+
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine((Get-TimerWatchProgressBar -Colors $c -Percent $Percent -Waiting:$waiting))
+    [void]$sb.AppendLine('')
+
+    if ($CurrentTimer.IsSequence) {
+        $seqTotal = Format-Duration -Seconds $CurrentTimer.TotalSeconds
+        [void]$sb.AppendLine((Format-TimerWatchRow -Colors $c -Label 'Seq. total' -Value $seqTotal -ValueAnsi $c.Primary))
+        [void]$sb.AppendLine('')
+    }
+
     return $sb
 }
 
@@ -775,26 +1087,44 @@ function Get-TimerWatchPhaseTimelineContent {
     }
     $c = $Colors
     $sb = [System.Text.StringBuilder]::new()
-    [void]$sb.AppendLine("")
-    [void]$sb.AppendLine($c.DarkCyan + "  Phases:" + $c.Reset)
+    [void]$sb.AppendLine((Get-TimerWatchSeparator -Colors $c))
+    [void]$sb.AppendLine('  ' + $c.Primary + 'Phases' + $c.Reset)
     $phases = $CurrentTimer.Phases
-    $maxShow = [math]::Min(6, $phases.Count)
-    $startIdx = [math]::Max(0, [int]$CurrentTimer.CurrentPhase - 2)
+    $maxShow = [math]::Min(5, $phases.Count)
+    $startIdx = [math]::Max(0, [int]$CurrentTimer.CurrentPhase - 1)
     $endIdx = [math]::Min($phases.Count - 1, $startIdx + $maxShow - 1)
+    $now = Get-Date
     for ($i = $startIdx; $i -le $endIdx; $i++) {
         $phase = $phases[$i]
         $pNum = $i + 1
-        $marker = if ($i -eq [int]$CurrentTimer.CurrentPhase) { $c.Cyan + ">" } else { " " }
-        $pColor = if ($i -lt [int]$CurrentTimer.CurrentPhase) { $c.Dim } elseif ($i -eq [int]$CurrentTimer.CurrentPhase) { $c.White } else { $c.Gray }
-        $checkMark = if ($i -lt [int]$CurrentTimer.CurrentPhase) { $c.Green + "[OK]" } else { "    " }
         $phaseDur = Format-Duration -Seconds $phase.Seconds
-        $line = "  " + $marker + " " + $checkMark + " " + $pColor + $pNum + ". " + $phase.Label + " (" + $phaseDur + ")" + $c.Reset
+        $isCurrent = ($i -eq [int]$CurrentTimer.CurrentPhase)
+        $isDone = ($i -lt [int]$CurrentTimer.CurrentPhase)
+
+        if ($isDone) {
+            $prefix = $c.Success + '  [x] '
+            $textColor = $c.Dim
+            $endColor = $c.Dim
+        }
+        elseif ($isCurrent) {
+            $prefix = $c.Warning + '  > '
+            $textColor = $c.Text + $c.Bold
+            $endColor = $c.Warning
+        }
+        else {
+            $prefix = $c.Dim + '    '
+            $textColor = $c.Dim
+            $endColor = $c.Muted
+        }
+
+        $phaseEnd = Get-SequencePhaseEndTime -Timer $CurrentTimer -PhaseIndex $i -Now $now
+        $endSuffix = if ($phaseEnd) { $endColor + ' @ ' + $phaseEnd.ToString('HH:mm:ss') + $c.Reset } else { '' }
+        $line = $prefix + $textColor + "$pNum. $($phase.Label) ($phaseDur)" + $c.Reset + $endSuffix
         [void]$sb.AppendLine($line)
     }
     if ($endIdx -lt $phases.Count - 1) {
         $moreCount = $phases.Count - $endIdx - 1
-        $moreLine = $c.Dim + "    ... " + $moreCount + " more phases" + $c.Reset
-        [void]$sb.AppendLine($moreLine)
+        [void]$sb.AppendLine('  ' + $c.Dim + "... $moreCount more" + $c.Reset)
     }
     return $sb
 }
@@ -812,17 +1142,135 @@ function Get-TimerNotificationConfig {
         Returns notification settings with defaults if not configured.
     #>
     $defaults = @{
-        Notify = 'popup'      # popup, toast, sound, silent
-        SoundFile = $null     # Path to custom sound file
+        Notify    = 'popup'
+        Webhook   = $null
+        SoundFile = $null
     }
-    
+
     if ($global:Config -and $global:Config.TimerDefaults) {
         $config = $global:Config.TimerDefaults
         if ($config.Notify) { $defaults.Notify = $config.Notify }
+        if ($config.Webhook) { $defaults.Webhook = $config.Webhook }
         if ($config.SoundFile) { $defaults.SoundFile = $config.SoundFile }
     }
-    
+
     return $defaults
+}
+
+function Resolve-TimerNotificationSettings {
+    <#
+    .SYNOPSIS
+        Resolves notify type and named webhook for a new timer.
+    #>
+    param(
+        [string]$NotifyOverride = $null,
+        [string]$WebhookOverride = $null,
+        [string]$PresetNotify = $null,
+        [string]$PresetWebhook = $null
+    )
+
+    $validTypes = @('popup', 'toast', 'sound', 'silent', 'webhook')
+    $notify = $null
+    $webhookName = $null
+
+    if ($NotifyOverride -and ($validTypes -contains $NotifyOverride.ToLower())) {
+        $notify = $NotifyOverride.ToLower()
+    }
+    elseif ($PresetNotify -and ($validTypes -contains $PresetNotify.ToLower())) {
+        $notify = $PresetNotify.ToLower()
+    }
+    else {
+        $config = Get-TimerNotificationConfig
+        if ($config.Notify -and ($validTypes -contains $config.Notify.ToLower())) {
+            $notify = $config.Notify.ToLower()
+        }
+        else {
+            $notify = 'popup'
+        }
+    }
+
+    if ($WebhookOverride) {
+        $webhookName = $WebhookOverride
+    }
+    elseif ($PresetWebhook) {
+        $webhookName = $PresetWebhook
+    }
+    else {
+        $config = Get-TimerNotificationConfig
+        $webhookName = $config.Webhook
+    }
+
+    $webhookUrl = $null
+    if ($notify -eq 'webhook') {
+        $webhookUrl = Resolve-TimerWebhookUrl -Name $webhookName
+        if (-not $webhookUrl) {
+            Write-Warning "PS1Timer: webhook notify requires a valid -Webhook name (configured in Config.Webhooks)."
+            $notify = 'popup'
+        }
+    }
+
+    return @{
+        NotifyType  = $notify
+        WebhookName = $webhookName
+        WebhookUrl  = $webhookUrl
+    }
+}
+
+function Get-TimerFireScriptWebhookBlock {
+    <#
+    .SYNOPSIS
+        PowerShell switch branch for webhook notifications in fire scripts.
+    #>
+    param([string]$WebhookUrl)
+    if ([string]::IsNullOrWhiteSpace($WebhookUrl)) { return "    'webhook' { }" }
+    $escapedUrl = $WebhookUrl -replace "'", "''"
+    return @"
+    'webhook' {
+        try {
+            `$payload = @{ content = (`$body -join ' | ') } | ConvertTo-Json -Compress
+            Invoke-RestMethod -Uri '$escapedUrl' -Method Post -Body `$payload -ContentType 'application/json' -TimeoutSec 15 | Out-Null
+        } catch {
+            "`$(Get-Date -Format 'o') ERROR webhook: `$(`$_.Exception.Message)" | Add-Content -LiteralPath `$logFile -Force
+        }
+    }
+"@
+}
+
+function Get-TimerFireScriptHistoryBlock {
+    <#
+    .SYNOPSIS
+        PowerShell block appended to fire scripts to record completion history.
+    #>
+    param(
+        [string]$TimerIdExpr,
+        [string]$LabelExpr,
+        [string]$SecondsExpr,
+        [string]$IsSequenceExpr
+    )
+    return @"
+
+try {
+    `$historyFile = Join-Path `$env:TEMP 'ps-timer-history.json'
+    `$entry = [PSCustomObject]@{
+        TimerId     = $TimerIdExpr
+        Label       = $LabelExpr
+        Seconds     = [int]$SecondsExpr
+        CompletedAt = (Get-Date).ToString('o')
+        IsSequence  = [bool]$IsSequenceExpr
+    }
+    `$history = @()
+    if (Test-Path -LiteralPath `$historyFile) {
+        `$raw = Get-Content -LiteralPath `$historyFile -Raw -ErrorAction SilentlyContinue
+        if (-not [string]::IsNullOrWhiteSpace(`$raw)) {
+            `$parsed = `$raw | ConvertFrom-Json
+            if (`$parsed -is [array]) { `$history = @(`$parsed) } elseif (`$parsed) { `$history = @(`$parsed) }
+        }
+    }
+    `$history += `$entry
+    `$utf8Hist = New-Object System.Text.UTF8Encoding `$true
+    [System.IO.File]::WriteAllText(`$historyFile, (ConvertTo-Json -InputObject `$history -Depth 5 -Compress), `$utf8Hist)
+} catch { }
+"@
 }
 
 function Get-TimerAfterStartAction {
@@ -878,7 +1326,7 @@ function Show-TimerNotification {
     #>
     param(
         [Parameter(Mandatory=$true)]
-        [ValidateSet('popup', 'toast', 'sound', 'silent')]
+        [ValidateSet('popup', 'toast', 'sound', 'silent', 'webhook')]
         [string]$Type,
         
         [Parameter(Mandatory=$true)]
@@ -909,6 +1357,9 @@ function Show-TimerNotification {
         }
         'silent' {
             # Nothing at all
+        }
+        'webhook' {
+            # Webhook is handled in scheduled-task fire scripts
         }
     }
 }
@@ -1054,22 +1505,9 @@ function Get-TimerNotificationType {
         Per-timer override value
     #>
     param([string]$Override = $null)
-    
-    $validTypes = @('popup', 'toast', 'sound', 'silent')
-    
-    # Check override first
-    if ($Override -and $validTypes -contains $Override.ToLower()) {
-        return $Override.ToLower()
-    }
-    
-    # Check config
-    $config = Get-TimerNotificationConfig
-    if ($config.Notify -and $validTypes -contains $config.Notify.ToLower()) {
-        return $config.Notify.ToLower()
-    }
-    
-    # Default
-    return 'popup'
+
+    $settings = Resolve-TimerNotificationSettings -NotifyOverride $Override
+    return $settings.NotifyType
 }
 
 function Show-TimerNotificationHelp {
@@ -1089,6 +1527,7 @@ function Show-TimerNotificationHelp {
     Write-Host "     # Use toast for this timer" -ForegroundColor DarkGray
     Write-Host "    t 30m -Notify sound          # Sound only" -ForegroundColor DarkGray
     Write-Host "    t 25m -Notify silent         # No notification" -ForegroundColor DarkGray
+    Write-Host "    t 25m -Notify webhook -Webhook discord-main" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  Notification Types:" -ForegroundColor Yellow
     Write-Host "    popup    " -ForegroundColor Green -NoNewline
@@ -1099,12 +1538,16 @@ function Show-TimerNotificationHelp {
     Write-Host "Play sound only, no popup" -ForegroundColor White
     Write-Host "    silent   " -ForegroundColor Green -NoNewline
     Write-Host "No notification at all" -ForegroundColor White
+    Write-Host "    webhook  " -ForegroundColor Green -NoNewline
+    Write-Host "POST to named URL from Config.Webhooks" -ForegroundColor White
     Write-Host ""
     Write-Host "  Default Configuration (config.ps1):" -ForegroundColor Yellow
     Write-Host "    TimerDefaults = @{" -ForegroundColor Gray
     Write-Host "        Notify = 'toast'" -ForegroundColor Gray
+    Write-Host "        Webhook = 'discord-main'  # When Notify = webhook" -ForegroundColor Gray
     Write-Host "        SoundFile = 'C:\\path\\to\\sound.wav'  # Optional" -ForegroundColor Gray
     Write-Host "    }" -ForegroundColor Gray
+    Write-Host "    Webhooks = @{ 'discord-main' = 'https://...' }" -ForegroundColor Gray
     Write-Host ""
 }
 # endregion Timer-Notifications.ps1
@@ -1260,7 +1703,8 @@ function Start-TimerJob {
     #>
     param(
         [PSCustomObject]$Timer,
-        [string]$Notify = 'popup'
+        [string]$Notify = 'popup',
+        [string]$WebhookUrl = $null
     )
 
     $taskName = if ($Timer.PSObject.Properties.Name -contains 'TaskName' -and -not [string]::IsNullOrWhiteSpace($Timer.TaskName)) {
@@ -1270,8 +1714,18 @@ function Start-TimerJob {
     }
     $dataFile = Join-Path $env:TEMP "ps-timers.json"
 
-    # Calculate trigger time
-    $triggerTime = (Get-Date).AddSeconds($Timer.Seconds)
+    if ($Notify -eq 'webhook' -and -not $WebhookUrl -and $Timer.WebhookName) {
+        $WebhookUrl = Resolve-TimerWebhookUrl -Name $Timer.WebhookName
+    }
+
+    $triggerTime = if ($Timer.State -eq 'Scheduled') {
+        [DateTime]::Parse($Timer.EndTime)
+    } else {
+        (Get-Date).AddSeconds($Timer.Seconds)
+    }
+
+    $webhookBlock = Get-TimerFireScriptWebhookBlock -WebhookUrl $WebhookUrl
+    $historyBlock = Get-TimerFireScriptHistoryBlock -TimerIdExpr '$timerId' -LabelExpr '$message' -SecondsExpr '$timerSeconds' -IsSequenceExpr '$false'
 
     # Build the notification script that runs when timer fires
     $script = @"
@@ -1287,8 +1741,7 @@ function Start-TimerJob {
 `$currentTaskName = '$taskName'
 
 try {
-    # Sound notification (if not silent)
-    if (`$notifyType -ne 'silent') {
+    if (`$notifyType -notin @('silent', 'webhook')) {
         try { [console]::beep(440, 500) } catch { }
     }
 
@@ -1435,12 +1888,14 @@ switch (`$notifyType) {
     'silent' {
         # No notification at all
     }
+$webhookBlock
     default {
         # Popup (default/original behavior)
         `$popup = New-Object -ComObject WScript.Shell
         `$popup.Popup((`$body -join [char]10), 0, `$message, 64) | Out-Null
     }
 }
+$historyBlock
 "@
 
     $null = Write-TimerFireScriptFile -TimerId $Timer.Id -ScriptBody $script
@@ -2185,7 +2640,8 @@ function New-SequenceTimerFromPhases {
         [array]$Phases,
         [object]$Summary,
         [DateTime]$Now,
-        [string]$NotifyType = 'popup'
+        [string]$NotifyType = 'popup',
+        [string]$WebhookName = $null
     )
     $firstPhase = $Phases[0]
     $endTime = $Now.AddSeconds($firstPhase.Seconds)
@@ -2221,6 +2677,7 @@ function New-SequenceTimerFromPhases {
         PhaseLabel      = $firstPhase.Label
         TotalSeconds    = $totalSecs
         NotifyType      = $NotifyType
+        WebhookName     = $WebhookName
         TaskName        = New-TimerTaskName -TimerId $Id
     }
     return $timer
@@ -2237,10 +2694,18 @@ function Write-SequenceTimerConfirmation {
         [object]$Summary,
         [int]$PhaseCount,
         [object]$FirstPhase,
-        [DateTime]$EndTime
+        [DateTime]$EndTime,
+        [DateTime]$ScheduledStart = $null,
+        [string]$NotifyLabel = $null,
+        [string]$WebhookName = $null
     )
     Write-Host ""
-    Write-Host "  Sequence started " -ForegroundColor Green -NoNewline
+    if ($ScheduledStart) {
+        Write-Host "  Sequence scheduled " -ForegroundColor Green -NoNewline
+    }
+    else {
+        Write-Host "  Sequence started " -ForegroundColor Green -NoNewline
+    }
     Write-Host "[$Id]" -ForegroundColor Cyan
     Write-Host "  Pattern:  " -ForegroundColor Gray -NoNewline
     Write-Host $OriginalPattern -ForegroundColor White
@@ -2251,8 +2716,18 @@ function Write-SequenceTimerConfirmation {
     Write-Host "  [1/$PhaseCount] " -ForegroundColor Magenta -NoNewline
     Write-Host $FirstPhase.Label -ForegroundColor Cyan -NoNewline
     Write-Host " - $(Format-Duration -Seconds $FirstPhase.Seconds)" -ForegroundColor White
+    if ($ScheduledStart) {
+        Write-Host "  Starts:   " -ForegroundColor Gray -NoNewline
+        Write-Host $ScheduledStart.ToString('HH:mm:ss') -ForegroundColor Cyan
+    }
     Write-Host "  Ends at:  " -ForegroundColor Gray -NoNewline
     Write-Host $EndTime.ToString('HH:mm:ss') -ForegroundColor Yellow
+    if ($NotifyLabel) {
+        $label = $NotifyLabel
+        if ($NotifyLabel -eq 'webhook' -and $WebhookName) { $label += " ($WebhookName)" }
+        Write-Host "  Notify:   " -ForegroundColor Gray -NoNewline
+        Write-Host $label -ForegroundColor Green
+    }
     Write-Host ""
 }
 
@@ -2270,9 +2745,19 @@ function Start-SequenceTimerJob {
     }
     $dataFile = Join-Path $env:TEMP "ps-timers.json"
     $notifyType = if ($Timer.NotifyType) { $Timer.NotifyType } else { 'popup' }
+    $webhookUrl = $null
+    if ($notifyType -eq 'webhook' -and $Timer.WebhookName) {
+        $webhookUrl = Resolve-TimerWebhookUrl -Name $Timer.WebhookName
+    }
 
-    # Calculate trigger time for current phase
-    $triggerTime = (Get-Date).AddSeconds($Timer.Seconds)
+    $triggerTime = if ($Timer.State -eq 'Scheduled') {
+        [DateTime]::Parse($Timer.EndTime)
+    } else {
+        (Get-Date).AddSeconds($Timer.Seconds)
+    }
+
+    $webhookBlock = Get-TimerFireScriptWebhookBlock -WebhookUrl $webhookUrl
+    $historyBlock = Get-TimerFireScriptHistoryBlock -TimerIdExpr '$timerId' -LabelExpr '$phaseLabel' -SecondsExpr '$timer.Seconds' -IsSequenceExpr '$true'
 
     # Build the notification script using here-string
     $script = @"
@@ -2308,7 +2793,7 @@ if (-not `$timer.IsSequence) { exit }
 `$totalPhases = [int]`$timer.TotalPhases
 `$phaseLabel = `$timer.PhaseLabel
 
-if (`$notifyType -ne 'silent') {
+if (`$notifyType -notin @('silent', 'webhook')) {
     try {
         if (`$currentPhase -eq `$totalPhases - 1) {
             [console]::beep(523, 200); [console]::beep(659, 200); [console]::beep(784, 400)
@@ -2429,11 +2914,13 @@ switch (`$notifyType) {
     }
     'sound' { }
     'silent' { }
+$webhookBlock
     default {
         `$popup = New-Object -ComObject WScript.Shell
         `$popup.Popup((`$body -join [char]10), 0, `$title, 64) | Out-Null
     }
 }
+$historyBlock
 "@
 
     $null = Write-TimerFireScriptFile -TimerId $Timer.Id -ScriptBody $script
@@ -2453,7 +2940,8 @@ function Show-TimerHelp {
         Shows timer commands help dashboard.
     #>
     Write-HelpMenu -Title "TIMER COMMANDS" -Commands @(
-        @{ Name='Timer <time>'; Alias='T'; Params='[msg] [repeat] [-Notify type]'; Desc='Start a timer (simple or sequence pattern)' }
+        @{ Name='Timer <time>'; Alias='T'; Params='[msg] [repeat] [-Notify] [-Webhook] [-At]'; Desc='Start a timer (simple or sequence pattern)' }
+        @{ Name='Timer-Stats'; Alias='TS'; Params=''; Desc='Show timer completion history (today/week)' }
         @{ Name='Timer-Presets'; Alias='TPRE'; Params=''; Desc='Pick from preset sequences (Pomodoro, etc.)' }
         @{ Name='Timer-List'; Alias='TL'; Params='[-a] [-w]'; Desc='List active timers (-a all, -w live watch)' }
         @{ Name='Timer-Watch'; Alias='TW'; Params='[id]'; Desc='Watch timer with progress bar (picker if no id)' }
@@ -2489,9 +2977,9 @@ function Show-TimerHelp {
             Title = 'NOTIFICATION OPTIONS'
             Underline = '===================='
             Lines = @(
-                @{ Type='text'; Label='  Per-timer: '; Value='t 25m -Notify toast'; LabelColor='Yellow'; ValueColor='Gray' }
+                @{ Type='text'; Label='  Per-timer: '; Value='t 25m -Notify webhook -Webhook discord-main'; LabelColor='Yellow'; ValueColor='Gray' }
                 @{ Type='raw'; Text='' }
-                @{ Type='raw'; Text='  Types: popup | toast | sound | silent'; Color='Green' }
+                @{ Type='raw'; Text='  Types: popup | toast | sound | silent | webhook'; Color='Green' }
                 @{ Type='raw'; Text='' }
                 @{ Type='raw'; Text='  popup  Modal dialog (default, blocks until OK)' }
                 @{ Type='raw'; Text='  toast  Windows toast notification (non-blocking)' }
@@ -2519,8 +3007,12 @@ function Timer {
     .PARAMETER Repeat
         Number of times to repeat the timer (e.g., -r 3 repeats 3 times total).
     .PARAMETER Notify
-        Notification type: popup (default), toast, sound, silent.
+        Notification type: popup (default), toast, sound, silent, webhook.
         Override default in config.ps1 / config.example.ps1 TimerDefaults.Notify.
+    .PARAMETER Webhook
+        Named webhook from Config.Webhooks (e.g. discord-main). Used with -Notify webhook.
+    .PARAMETER At
+        Schedule start at HH:mm today (24h). Timer runs from that time.
     .PARAMETER AfterStart
         After start: none, watch (tw), list (tl -w). Overrides TimerDefaults.AfterStart.
     .EXAMPLE
@@ -2530,14 +3022,17 @@ function Timer {
         t pomodoro
         t "(25m work, 5m rest)x4"
         t 25m -Notify toast
-        t 30m 'Drink water' -Notify sound
+        t 25m -Notify webhook -Webhook discord-main
+        t 25m work -At "14:30"
     #>
     param(
         [Parameter(Position=0)][string]$Time,
         [Parameter(Position=1)][Alias('m')][string]$Message = "Time is up!",
         [Parameter(Position=2)][Alias('r')][int]$Repeat = 1,
-        [ValidateSet('popup', 'toast', 'sound', 'silent')]
+        [ValidateSet('popup', 'toast', 'sound', 'silent', 'webhook')]
         [string]$Notify = $null,
+        [string]$Webhook = $null,
+        [string]$At = $null,
         [ValidateSet('none', 'watch', 'list')]
         [string]$AfterStart = $null
     )
@@ -2550,7 +3045,7 @@ function Timer {
 
     # Check if this is a sequence pattern or preset
     if (Test-TimerSequence -Pattern $Time) {
-        Start-SequenceTimer -Pattern $Time -Notify $Notify -AfterStart $AfterStart
+        Start-SequenceTimer -Pattern $Time -Notify $Notify -Webhook $Webhook -At $At -AfterStart $AfterStart
         return
     }
 
@@ -2564,45 +3059,60 @@ function Timer {
 
     if ($Repeat -lt 1) { $Repeat = 1 }
 
-    # Generate unique ID
+    $scheduledStart = $null
+    if ($At) {
+        $scheduledStart = Parse-TimerAtTime -At $At
+        if (-not $scheduledStart) {
+            Write-Host "Invalid -At time. Use HH:mm in the future today (e.g. 14:30)." -ForegroundColor Red
+            return
+        }
+    }
+
     $id = New-TimerId
     $now = Get-Date
-    $endTime = $now.AddSeconds($seconds)
+    $startTime = if ($scheduledStart) { $scheduledStart } else { $now }
+    $endTime = $startTime.AddSeconds($seconds)
+    $timerState = if ($scheduledStart) { 'Scheduled' } else { 'Running' }
 
-    # Determine notification type
-    $notificationType = Get-TimerNotificationType -Override $Notify
-    
-    # Create timer metadata
+    $notifySettings = Resolve-TimerNotificationSettings -NotifyOverride $Notify -WebhookOverride $Webhook
+
     $timer = [PSCustomObject]@{
         Id              = $id
         Duration        = $Time
         Seconds         = $seconds
         Message         = $Message
-        StartTime       = $now.ToString('o')
+        StartTime       = $startTime.ToString('o')
         EndTime         = $endTime.ToString('o')
         RepeatTotal     = $Repeat
         RepeatRemaining = $Repeat - 1
         CurrentRun      = 1
-        State           = 'Running'
+        State           = $timerState
         IsSequence      = $false
-        NotifyType      = $notificationType
+        NotifyType      = $notifySettings.NotifyType
+        WebhookName     = $notifySettings.WebhookName
         TaskName        = New-TimerTaskName -TimerId $id
     }
 
-    # Save to data file
     $timers = @(Get-TimerData)
     $timers += $timer
     Save-TimerData -Timers $timers
 
-    # Start the job
-    Start-TimerJob -Timer $timer -Notify $notificationType
+    Start-TimerJob -Timer $timer -Notify $notifySettings.NotifyType -WebhookUrl $notifySettings.WebhookUrl
 
-    # Display confirmation
     Write-Host ""
-    Write-Host "  Timer started " -ForegroundColor Green -NoNewline
+    if ($timerState -eq 'Scheduled') {
+        Write-Host "  Timer scheduled " -ForegroundColor Green -NoNewline
+    }
+    else {
+        Write-Host "  Timer started " -ForegroundColor Green -NoNewline
+    }
     Write-Host "[$id]" -ForegroundColor Cyan
     Write-Host "  Duration: " -ForegroundColor Gray -NoNewline
     Write-Host (Format-Duration -Seconds $seconds) -ForegroundColor White
+    if ($timerState -eq 'Scheduled') {
+        Write-Host "  Starts:   " -ForegroundColor Gray -NoNewline
+        Write-Host $startTime.ToString('HH:mm:ss') -ForegroundColor Cyan
+    }
     Write-Host "  Ends at:  " -ForegroundColor Gray -NoNewline
     Write-Host $endTime.ToString('HH:mm:ss') -ForegroundColor Yellow
     if ($Repeat -gt 1) {
@@ -2612,7 +3122,11 @@ function Timer {
     Write-Host "  Message:  " -ForegroundColor Gray -NoNewline
     Write-Host $Message -ForegroundColor White
     Write-Host "  Notify:   " -ForegroundColor Gray -NoNewline
-    Write-Host $notificationType -ForegroundColor Green
+    $notifyLabel = $notifySettings.NotifyType
+    if ($notifySettings.NotifyType -eq 'webhook' -and $notifySettings.WebhookName) {
+        $notifyLabel += " ($($notifySettings.WebhookName))"
+    }
+    Write-Host $notifyLabel -ForegroundColor Green
     Write-Host ""
 
     Invoke-TimerAfterStart -TimerId $id -AfterStart $AfterStart
@@ -2625,19 +3139,30 @@ function Start-SequenceTimer {
     .PARAMETER Pattern
         Sequence pattern string or preset name.
     .PARAMETER Notify
-        Notification type: popup (default), toast, sound, silent.
+        Notification type: popup (default), toast, sound, silent, webhook.
+    .PARAMETER Webhook
+        Named webhook from Config.Webhooks when using -Notify webhook.
+    .PARAMETER At
+        Schedule sequence start at HH:mm today (24h).
     .PARAMETER AfterStart
         After start: none, watch (tw), list (tl -w). Overrides TimerDefaults.AfterStart.
     #>
     param(
         [string]$Pattern,
         [string]$Notify = $null,
+        [string]$Webhook = $null,
+        [string]$At = $null,
         [string]$AfterStart = $null
     )
 
     $originalPattern = $Pattern
+    $presetNotify = $null
+    $presetWebhook = $null
     if (($script:TimerPresets.Keys -contains $Pattern)) {
-        $Pattern = $script:TimerPresets[$Pattern].Pattern
+        $preset = $script:TimerPresets[$Pattern]
+        $Pattern = $preset.Pattern
+        if ($preset.Notify) { $presetNotify = $preset.Notify }
+        if ($preset.Webhook) { $presetWebhook = $preset.Webhook }
     }
 
     try {
@@ -2657,17 +3182,32 @@ function Start-SequenceTimer {
     $summary = Get-SequenceSummary -Phases $phases
     $id = New-TimerId
     $now = Get-Date
-    $notificationType = Get-TimerNotificationType -Override $Notify
-    $timer = New-SequenceTimerFromPhases -Id $id -OriginalPattern $originalPattern -Phases $phases -Summary $summary -Now $now -NotifyType $notificationType
+
+    $scheduledStart = $null
+    if ($At) {
+        $scheduledStart = Parse-TimerAtTime -At $At
+        if (-not $scheduledStart) {
+            Write-Host "Invalid -At time. Use HH:mm in the future today (e.g. 14:30)." -ForegroundColor Red
+            return
+        }
+    }
+
+    $notifySettings = Resolve-TimerNotificationSettings -NotifyOverride $Notify -WebhookOverride $Webhook -PresetNotify $presetNotify -PresetWebhook $presetWebhook
+    $startTime = if ($scheduledStart) { $scheduledStart } else { $now }
+    $timerState = if ($scheduledStart) { 'Scheduled' } else { 'Running' }
+
+    $timer = New-SequenceTimerFromPhases -Id $id -OriginalPattern $originalPattern -Phases $phases -Summary $summary -Now $startTime -NotifyType $notifySettings.NotifyType -WebhookName $notifySettings.WebhookName
+    $timer.State = $timerState
+    $firstPhase = $phases[0]
+    $timer.EndTime = $startTime.AddSeconds($firstPhase.Seconds).ToString('o')
 
     $timers = @(Get-TimerData)
     $timers += $timer
     Save-TimerData -Timers $timers
     Start-SequenceTimerJob -Timer $timer
 
-    $firstPhase = $phases[0]
-    $endTime = $now.AddSeconds($firstPhase.Seconds)
-    Write-SequenceTimerConfirmation -Id $id -OriginalPattern $originalPattern -Summary $summary -PhaseCount $phases.Count -FirstPhase $firstPhase -EndTime $endTime
+    $endTime = [DateTime]::Parse($timer.EndTime)
+    Write-SequenceTimerConfirmation -Id $id -OriginalPattern $originalPattern -Summary $summary -PhaseCount $phases.Count -FirstPhase $firstPhase -EndTime $endTime -ScheduledStart $scheduledStart -NotifyLabel $notifySettings.NotifyType -WebhookName $notifySettings.WebhookName
 
     Invoke-TimerAfterStart -TimerId $id -AfterStart $AfterStart
 }
@@ -2714,7 +3254,7 @@ function Show-TimerListOnce {
 
     # Filter if not showing all
     if (-not $All) {
-        $timers = @($timers | Where-Object { $_.State -eq 'Running' -or $_.State -eq 'Paused' })
+        $timers = @($timers | Where-Object { $_.State -eq 'Running' -or $_.State -eq 'Scheduled' -or $_.State -eq 'Paused' })
     }
 
     if ($timers.Count -eq 0) {
@@ -2816,7 +3356,7 @@ function Show-TimerListWatch {
 
             $displayTimers = $timers
             if (-not $All) {
-                $displayTimers = @($timers | Where-Object { $_.State -eq 'Running' -or $_.State -eq 'Paused' })
+                $displayTimers = @($timers | Where-Object { $_.State -eq 'Running' -or $_.State -eq 'Scheduled' -or $_.State -eq 'Paused' })
             }
 
             $sb = [System.Text.StringBuilder]::new()
@@ -2828,7 +3368,7 @@ function Show-TimerListWatch {
                 foreach ($delay in $pollMs) {
                     Start-Sleep -Milliseconds $delay
                     $refresh = Get-TimerDataIfChanged -Force
-                    $refreshedActive = @($refresh.Data | Where-Object { $_.State -eq 'Running' -or $_.State -eq 'Paused' })
+                    $refreshedActive = @($refresh.Data | Where-Object { $_.State -eq 'Running' -or $_.State -eq 'Scheduled' -or $_.State -eq 'Paused' })
                     if ($refreshedActive.Count -gt 0) {
                         $timers = @($refresh.Data)
                         $displayTimers = $refreshedActive
@@ -2838,7 +3378,7 @@ function Show-TimerListWatch {
                 }
                 if (-not $foundNextRun) {
                     [void]$sb.AppendLine("")
-                    [void]$sb.AppendLine("$($c.Gray)  No active timers.$($c.Reset)")
+                    [void]$sb.AppendLine("$($c.Muted)  No active timers.$($c.Reset)")
                     Clear-Host
                     [Console]::Write($sb.ToString())
                     break
@@ -2849,20 +3389,20 @@ function Show-TimerListWatch {
             $paused = @($displayTimers | Where-Object { $_.State -eq 'Paused' }).Count
 
             [void]$sb.AppendLine("")
-            $pausedPart = if ($paused -gt 0) { "$($c.Yellow), $paused paused$($c.Reset)" } else { "" }
-            [void]$sb.AppendLine("$($c.Cyan)  BACKGROUND TIMERS $($c.Green)($running running${pausedPart}$($c.Green))$($c.Reset)")
-            [void]$sb.AppendLine("$($c.DarkCyan)  =====================$($c.Reset)")
+            $pausedPart = if ($paused -gt 0) { "$($c.Warning), $paused paused$($c.Reset)" } else { "" }
+            [void]$sb.AppendLine("$($c.Primary)  BACKGROUND TIMERS $($c.Success)($running running${pausedPart}$($c.Success))$($c.Reset)")
+            [void]$sb.AppendLine("$($c.PrimaryMuted)  =====================$($c.Reset)")
             [void]$sb.AppendLine("")
 
             $colWidths = @{ Id = 5; State = 10; Duration = 11; Remaining = 11; Progress = 8; EndsAt = 10; Phase = 8 }
             $hdr = "  {0,-5}{1,-10}{2,-11}{3,-11}{4,-8}{5,-10}{6,-8}MESSAGE" -f "ID", "STATE", "DURATION", "REMAINING", "PROG", "ENDS AT", "PHASE"
-            [void]$sb.AppendLine("$($c.Gray)$hdr$($c.Reset)")
-            [void]$sb.AppendLine("$($c.Gray)  $("-" * 83)$($c.Reset)")
+            [void]$sb.AppendLine("$($c.Muted)$hdr$($c.Reset)")
+            [void]$sb.AppendLine("$($c.Muted)  $("-" * 83)$($c.Reset)")
             foreach ($t in $displayTimers) {
                 [void]$sb.AppendLine((Get-TimerListWatchRowLine -Timer $t -Now $now -Colors $c -ColWidths $colWidths))
             }
             [void]$sb.AppendLine("")
-            [void]$sb.AppendLine("$($c.Gray)  Press any key to exit watch mode...$($c.Reset)")
+            [void]$sb.AppendLine("$($c.Muted)  Press any key to exit watch mode...$($c.Reset)")
             Clear-Host
             [Console]::Write($sb.ToString())
             if (Wait-OneSecondOrKeyPress -Stopwatch $sw) {
@@ -2980,7 +3520,7 @@ function Show-TimerWatchDisplay {
                 }
             }
 
-            if (-not $currentTimer -or $currentTimer.State -ne 'Running') {
+            if (-not $currentTimer -or ($currentTimer.State -ne 'Running' -and $currentTimer.State -ne 'Scheduled')) {
                 Clear-Host
                 Write-Host ""
                 Write-Host "  Timer [$($Timer.Id)] is no longer running." -ForegroundColor Yellow
@@ -3199,6 +3739,110 @@ function Timer-Remove {
     }
 }
 
+function Get-TimerHistory {
+    <#
+    .SYNOPSIS
+        Loads timer completion history from JSON file.
+    #>
+    if (-not (Test-Path -LiteralPath $script:TimerHistoryFile)) {
+        return @()
+    }
+
+    try {
+        $content = [System.IO.File]::ReadAllText($script:TimerHistoryFile)
+        if ([string]::IsNullOrWhiteSpace($content)) { return @() }
+        $data = $content | ConvertFrom-Json
+        if ($null -eq $data) { return @() }
+        if ($data -is [System.Array]) { return @($data) }
+        return @($data)
+    }
+    catch {
+        return @()
+    }
+}
+
+function Get-TimerStatsSummary {
+    <#
+    .SYNOPSIS
+        Aggregates history into today/week totals and per-label breakdown.
+    #>
+    param([array]$History = @(Get-TimerHistory))
+
+    $now = Get-Date
+    $todayStart = $now.Date
+    $weekStart = $todayStart.AddDays(-6)
+
+    $todaySeconds = 0
+    $weekSeconds = 0
+    $todayCount = 0
+    $weekCount = 0
+    $labelTotals = @{}
+
+    foreach ($entry in $History) {
+        if (-not $entry.CompletedAt) { continue }
+        try {
+            $completed = [DateTime]::Parse($entry.CompletedAt)
+        }
+        catch { continue }
+
+        $secs = [int]$entry.Seconds
+        if ($completed -ge $weekStart) {
+            $weekSeconds += $secs
+            $weekCount++
+        }
+        if ($completed.Date -eq $todayStart) {
+            $todaySeconds += $secs
+            $todayCount++
+        }
+
+        $label = if ($entry.Label) { [string]$entry.Label } else { 'timer' }
+        if (-not $labelTotals.ContainsKey($label)) { $labelTotals[$label] = 0 }
+        $labelTotals[$label] += $secs
+    }
+
+    return @{
+        TodaySeconds = $todaySeconds
+        TodayCount   = $todayCount
+        WeekSeconds  = $weekSeconds
+        WeekCount    = $weekCount
+        LabelTotals  = $labelTotals
+    }
+}
+
+function Timer-Stats {
+    <#
+    .SYNOPSIS
+        Shows timer completion history summary (today, week, labels).
+    #>
+    $summary = Get-TimerStatsSummary
+    $c = Get-AnsiColors
+
+    Write-Host ""
+    Write-Host "$($c.Primary)  TIMER STATS$($c.Reset)"
+    Write-Host "$($c.PrimaryMuted)  ===========$($c.Reset)"
+    Write-Host ""
+
+    if ($summary.WeekCount -eq 0) {
+        Write-Host "$($c.Muted)  No completed timer history yet.$($c.Reset)"
+        Write-Host "$($c.Dim)  History is recorded when timers finish.$($c.Reset)"
+        Write-Host ""
+        return
+    }
+
+    Write-Host "$($c.Muted)  TODAY  $($c.Text)$(Format-Duration -Seconds $summary.TodaySeconds)$($c.Muted)  ($($summary.TodayCount) completions)$($c.Reset)"
+    Write-Host "$($c.Muted)  WEEK   $($c.Text)$(Format-Duration -Seconds $summary.WeekSeconds)$($c.Muted)  ($($summary.WeekCount) completions)$($c.Reset)"
+    Write-Host ""
+
+    if ($summary.LabelTotals.Count -gt 0) {
+        Write-Host "$($c.Muted)  LABELS$($c.Reset)"
+        foreach ($label in ($summary.LabelTotals.Keys | Sort-Object)) {
+            $dur = Format-Duration -Seconds $summary.LabelTotals[$label]
+            Write-Host "    $($c.Primary)$label$($c.Reset)  $($c.Text)$dur$($c.Reset)"
+        }
+        Write-Host ""
+    }
+}
+
 # Backward-compatible wrappers (legacy names)
 function TimerList { Timer-List @args }
 function TimerWatch { Timer-Watch @args }
@@ -3206,6 +3850,7 @@ function TimerPause { Timer-Pause @args }
 function TimerResume { Timer-Resume @args }
 function TimerRemove { Timer-Remove @args }
 function TimerPresets { Timer-Presets @args }
+function TimerStats { Timer-Stats @args }
 
 # endregion Timer-Main.ps1
 
@@ -3220,5 +3865,6 @@ Set-Alias -Name tp -Value Timer-Pause -Scope Global
 Set-Alias -Name tr -Value Timer-Resume -Scope Global
 Set-Alias -Name td -Value Timer-Remove -Scope Global
 Set-Alias -Name tpre -Value Timer-Presets -Scope Global
+Set-Alias -Name ts -Value Timer-Stats -Scope Global
 # endregion Timer-Aliases.ps1
 

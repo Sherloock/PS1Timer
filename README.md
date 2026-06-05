@@ -55,6 +55,11 @@ td done                        # remove completed timers
 t 25m -Notify toast
 t 10m -Notify sound
 t 5m -Notify silent
+t 25m -Notify webhook -Webhook discord-main
+
+# Stats & scheduled start
+ts                             # today/week completion stats
+t 25m work -At "14:30"         # starts at 14:30 today
 ```
 
 ## Commands
@@ -68,6 +73,7 @@ t 5m -Notify silent
 | `Timer-Pause` | `tp` | Pause by id or `all` |
 | `Timer-Resume` | `tr` | Resume paused/lost timers |
 | `Timer-Remove` | `td` | Remove by id, `done`, or `all` |
+| `Timer-Stats` | `ts` | Completion history (today/week/labels) |
 
 Full reference: [docs/commands.md](docs/commands.md)
 
@@ -102,7 +108,7 @@ Works out of the box — no copy step required.
 | [`config.example.ps1`](config.example.ps1) | Defaults + **19 presets** — loaded automatically when `config.ps1` is absent |
 | `config.ps1` | Optional personal settings (gitignored) — **replaces** the example when present |
 
-`TimerDefaults` keys: `Notify`, `SoundFile`, `AfterStart` (`none` | `watch` | `list`).
+`TimerDefaults` keys: `Notify`, `Webhook`, `SoundFile`, `Theme`, `AfterStart` (`none` | `watch` | `list`). `Theme` selects a palette from `Palettes` — each palette has semantic roles (`Primary`, `Success`, `Warning`, …) set to named colors (`cyan`, `green`, `yellow`, …). Named URLs live in `Webhooks` (e.g. `discord-main`).
 
 To customize:
 

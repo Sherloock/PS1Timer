@@ -8,9 +8,18 @@ All notable changes to PS1Timer are documented here.
 
 - `TimerDefaults.AfterStart`: `none` | `watch` | `list` — optional `tw` or `tl -w` after starting a timer
 - Per-command `-AfterStart` on `Timer` / `t`
+- Webhook notifications via named `Config.Webhooks` and `-Notify webhook -Webhook <name>`
+- `Timer-Stats` (`ts`) — today/week/label completion history
+- `-At HH:mm` scheduled start for simple and sequence timers
+- `TimerDefaults.Theme` — `default` | `minimal` | `vibrant` | `monochrome`
+- Per-preset `Notify` and `Webhook` overrides
+- Config validation warnings on module load (`Assert-TimerConfig`)
+- Watch UI box-drawing frame and color-shifting progress bar
+- `tw` shows **Final end** for sequences/repeats; sequence **Ends** row removed; phase timeline shows `@ HH:mm:ss` per phase
 
 ### Changed
 
+- Color palettes in `Config.Palettes` use semantic roles (`Primary`, `Success`, `Warning`, …) with named colors (`cyan`, `green`, `yellow`, …)
 - `config.example.ps1` loads automatically when `config.ps1` is absent (zero-config install)
 - All presets live in `Config.Presets` inside config (removed `src/BuiltInPresets.ps1`)
 - `TimerPresets` config key deprecated in favor of `Presets`

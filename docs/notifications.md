@@ -10,6 +10,7 @@ When a timer phase completes, PS1Timer notifies you using the configured mode.
 | `toast` | Windows toast via `NotifyIcon` balloon |
 | `sound` | Console beep or custom `.wav` |
 | `silent` | No notification (timer still advances) |
+| `webhook` | POST JSON to a named URL from `Config.Webhooks` |
 
 ## Default configuration
 
@@ -20,9 +21,14 @@ To customize, copy to `config.ps1` and edit:
 ```powershell
 $global:Config = @{
     TimerDefaults = @{
-        Notify     = 'popup'    # popup | toast | sound | silent
+        Notify     = 'popup'    # popup | toast | sound | silent | webhook
+        Webhook    = 'discord-main'  # default named webhook when Notify = webhook
         SoundFile  = $null      # e.g. 'C:\sounds\alarm.wav'
         AfterStart = 'none'     # none | watch | list
+    }
+    Webhooks = @{
+        'discord-main' = 'https://discord.com/api/webhooks/...'
+        'ntfy-phone'   = 'https://ntfy.sh/my-topic'
     }
 }
 ```
@@ -35,7 +41,16 @@ Reload: `Import-Module .\PS1Timer.psd1 -Force`
 t 25m -Notify toast
 t 10m -Notify sound -Message "Break over"
 t 5m -Notify silent
+t 25m -Notify webhook -Webhook discord-main
 ```
+
+Presets may set `Notify` and `Webhook` per preset (e.g. `tabata` with `Notify = 'sound'`).
+
+## Webhook mode
+
+- Define URLs in `Config.Webhooks` by name
+- Use `-Notify webhook -Webhook <name>` or set `TimerDefaults.Webhook` as default
+- Payload: `{ "content": "message | details" }` (Discord-compatible)
 
 ## Sound mode
 

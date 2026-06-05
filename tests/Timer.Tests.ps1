@@ -12,6 +12,7 @@ BeforeAll {
     . "$ModuleRoot\src\Timer.ps1"
 
     $script:TimerDataFile = "$TestDrive\ps-timers.json"
+    $script:TimerHistoryFile = "$TestDrive\ps-timer-history.json"
     $script:TimerForceSyncRegister = $true
 
     function Reset-TimerDataCacheForTests {
@@ -87,6 +88,34 @@ Describe "Timer" {
 
         $timers = @(Get-TimerData)
         $timers[0].RepeatTotal | Should -Be 1
+    }
+
+    It "creates scheduled timer with -At" {
+        Mock Get-Date { [DateTime]'2026-06-05T10:00:00' }
+
+        Timer -Time "25m" -Message "Work" -At "14:30"
+
+        $timers = @(Get-TimerData)
+        $timers[0].State | Should -Be 'Scheduled'
+        ([DateTime]::Parse($timers[0].StartTime)).ToString('HH:mm') | Should -Be '14:30'
+        ([DateTime]::Parse($timers[0].EndTime)).ToString('HH:mm') | Should -Be '14:55'
+    }
+
+    It "stores webhook name when notify is webhook" {
+        $saved = $global:Config
+        try {
+            $global:Config = @{
+                Webhooks = @{ 'discord-main' = 'https://example.com/hook' }
+            }
+            Timer -Time "1m" -Notify webhook -Webhook 'discord-main'
+
+            $timers = @(Get-TimerData)
+            $timers[0].NotifyType | Should -Be 'webhook'
+            $timers[0].WebhookName | Should -Be 'discord-main'
+        }
+        finally {
+            $global:Config = $saved
+        }
     }
 }
 
@@ -503,6 +532,162 @@ Describe "TimerList" {
 # SHOW-TIMER WATCH DISPLAY (single-timer watch)
 # ============================================================================
 
+Describe "Get-TimerFinalEndTime" {
+    It "returns current EndTime for simple timer" {
+        $now = [DateTime]::new(2024, 6, 1, 12, 0, 0)
+        $end = $now.AddMinutes(5)
+        $timer = [PSCustomObject]@{
+            IsSequence       = $false
+            Seconds          = 300
+            EndTime          = $end.ToString('o')
+            StartTime        = $now.ToString('o')
+            State            = 'Running'
+            RepeatTotal      = 1
+            RepeatRemaining  = 0
+        }
+        $result = Get-TimerFinalEndTime -Timer $timer -Now $now
+        $result | Should -Be $end
+    }
+
+    It "adds remaining repeats for repeat timer" {
+        $now = [DateTime]::new(2024, 6, 1, 12, 0, 0)
+        $end = $now.AddMinutes(5)
+        $timer = [PSCustomObject]@{
+            IsSequence       = $false
+            Seconds          = 300
+            EndTime          = $end.ToString('o')
+            StartTime        = $now.ToString('o')
+            State            = 'Running'
+            RepeatTotal      = 3
+            RepeatRemaining  = 2
+        }
+        $result = Get-TimerFinalEndTime -Timer $timer -Now $now
+        $result | Should -Be $end.AddMinutes(10)
+    }
+
+    It "sums future phases for sequence timer" {
+        $now = [DateTime]::new(2024, 6, 1, 12, 0, 0)
+        $end = $now.AddMinutes(25)
+        $timer = [PSCustomObject]@{
+            IsSequence       = $true
+            TotalSeconds     = 1800
+            Seconds          = 1500
+            EndTime          = $end.ToString('o')
+            StartTime        = $now.ToString('o')
+            State            = 'Running'
+            CurrentPhase     = 0
+            Phases           = @(
+                @{ Seconds = 1500; Label = 'work' }
+                @{ Seconds = 300; Label = 'break' }
+            )
+            RepeatTotal      = 1
+            RepeatRemaining  = 0
+        }
+        $result = Get-TimerFinalEndTime -Timer $timer -Now $now
+        $result | Should -Be $end.AddMinutes(5)
+    }
+
+    It "uses scheduled start plus total seconds for scheduled sequence" {
+        $now = [DateTime]::new(2024, 6, 1, 12, 0, 0)
+        $start = $now.AddHours(1)
+        $timer = [PSCustomObject]@{
+            IsSequence       = $true
+            TotalSeconds     = 1800
+            Seconds          = 1500
+            EndTime          = $start.AddMinutes(25).ToString('o')
+            StartTime        = $start.ToString('o')
+            State            = 'Scheduled'
+            CurrentPhase     = 0
+            Phases           = @(
+                @{ Seconds = 1500; Label = 'work' }
+                @{ Seconds = 300; Label = 'break' }
+            )
+            RepeatTotal      = 1
+            RepeatRemaining  = 0
+        }
+        $result = Get-TimerFinalEndTime -Timer $timer -Now $now
+        $result | Should -Be $start.AddSeconds(1800)
+    }
+}
+
+Describe "Get-TimerWatchRunningContent" {
+    It "includes Final end but not Ends row for sequence timers" {
+        $now = [DateTime]::new(2024, 6, 1, 12, 0, 0)
+        $phaseEnd = $now.AddMinutes(25)
+        $currentTimer = [PSCustomObject]@{
+            IsSequence       = $true
+            TotalPhases      = 2
+            TotalSeconds     = 1800
+            Seconds          = 1500
+            EndTime          = $phaseEnd.ToString('o')
+            StartTime        = $now.ToString('o')
+            State            = 'Running'
+            CurrentPhase     = 0
+            PhaseLabel       = 'work'
+            Phases           = @(
+                @{ Seconds = 1500; Label = 'work' }
+                @{ Seconds = 300; Label = 'break' }
+            )
+            RepeatTotal      = 1
+            RepeatRemaining  = 0
+        }
+        $timer = [PSCustomObject]@{ Id = '1'; Message = 'work'; Seconds = 1500; RepeatTotal = 1 }
+        Mock Get-Date { return $now }
+        $colors = Get-AnsiColors
+        $content = Get-TimerWatchRunningContent -Colors $colors -CurrentTimer $currentTimer -Timer $timer -Percent 50 -Remaining ([TimeSpan]::FromMinutes(12)) -EndsAtFormatted $phaseEnd.ToString('HH:mm:ss')
+        $text = $content.ToString()
+        $text | Should -Match 'Final end'
+        $text | Should -Match '12:30:00'
+        $text | Should -Not -Match 'Ends       '
+    }
+}
+
+Describe "Get-TimerWatchPhaseTimelineContent" {
+    It "shows end time after each visible phase" {
+        $now = [DateTime]::new(2024, 6, 1, 12, 0, 0)
+        $phaseEnd = $now.AddMinutes(45)
+        $currentTimer = [PSCustomObject]@{
+            IsSequence   = $true
+            TotalPhases  = 3
+            EndTime      = $phaseEnd.ToString('o')
+            StartTime    = $now.ToString('o')
+            State        = 'Running'
+            CurrentPhase = 0
+            Phases       = @(
+                @{ Seconds = 2700; Label = 'water' }
+                @{ Seconds = 2700; Label = 'water' }
+                @{ Seconds = 2700; Label = 'water' }
+            )
+        }
+        Mock Get-Date { return $now }
+        $colors = Get-AnsiColors
+        $content = Get-TimerWatchPhaseTimelineContent -Colors $colors -CurrentTimer $currentTimer
+        $plain = ($content.ToString() -replace '\x1b\[[0-9;]*m', '')
+        $plain | Should -Match '1\. water \(45m\) @ 12:45:00'
+        $plain | Should -Match '2\. water \(45m\) @ 13:30:00'
+        $plain | Should -Match '3\. water \(45m\) @ 14:15:00'
+    }
+}
+
+Describe "Get-SequencePhaseEndTime" {
+    It "returns cumulative end times from scheduled start" {
+        $now = [DateTime]::new(2024, 6, 1, 12, 0, 0)
+        $start = $now.AddHours(1)
+        $timer = [PSCustomObject]@{
+            State        = 'Scheduled'
+            StartTime    = $start.ToString('o')
+            EndTime      = $start.AddMinutes(45).ToString('o')
+            CurrentPhase = 0
+            Phases       = @(
+                @{ Seconds = 2700; Label = 'water' }
+                @{ Seconds = 2700; Label = 'water' }
+            )
+        }
+        Get-SequencePhaseEndTime -Timer $timer -PhaseIndex 0 -Now $now | Should -Be $start.AddMinutes(45)
+        Get-SequencePhaseEndTime -Timer $timer -PhaseIndex 1 -Now $now | Should -Be $start.AddMinutes(90)
+    }
+}
+
 Describe "Show-TimerWatchDisplay" {
     BeforeAll {
         $script:WatchDisplayCallCount = 0
@@ -648,5 +833,82 @@ Describe "Sequence phase advance (JSON)" {
         $phases = @($singlePhase)
         $phases[0].Seconds | Should -Be 5
         @($phases).Count | Should -Be 1
+    }
+}
+
+Describe "Timer stats" {
+    BeforeEach {
+        Reset-TimerDataCacheForTests
+        if (Test-Path $script:TimerHistoryFile) { Remove-Item $script:TimerHistoryFile -Force }
+    }
+
+    It "aggregates today and week totals" {
+        $today = (Get-Date).Date.AddHours(12).ToString('o')
+        $old = (Get-Date).Date.AddDays(-3).ToString('o')
+        $history = @(
+            [PSCustomObject]@{ TimerId = '1'; Label = 'work'; Seconds = 1500; CompletedAt = $today; IsSequence = $false }
+            [PSCustomObject]@{ TimerId = '2'; Label = 'break'; Seconds = 300; CompletedAt = $today; IsSequence = $false }
+            [PSCustomObject]@{ TimerId = '3'; Label = 'work'; Seconds = 600; CompletedAt = $old; IsSequence = $false }
+        )
+        $utf8 = New-Object System.Text.UTF8Encoding $true
+        [System.IO.File]::WriteAllText($script:TimerHistoryFile, (ConvertTo-Json -InputObject $history -Compress), $utf8)
+
+        $summary = Get-TimerStatsSummary
+        $summary.TodayCount | Should -Be 2
+        $summary.WeekCount | Should -Be 3
+        $summary.LabelTotals['work'] | Should -Be 2100
+        $summary.LabelTotals['break'] | Should -Be 300
+    }
+}
+
+Describe "Fire script generation" {
+    BeforeAll {
+        Mock Register-ScheduledTask { }
+        Mock Remove-TimerScheduledTaskByName { }
+    }
+
+    BeforeEach {
+        Reset-TimerDataCacheForTests
+        if (Test-Path $script:TimerDataFile) { Remove-Item $script:TimerDataFile -Force }
+    }
+
+    It "writes a parseable fire script for webhook timers" {
+        $saved = $global:Config
+        try {
+            $global:Config = @{
+                Webhooks = @{ 'discord' = 'https://example.com/hook' }
+            }
+            Timer -Time '5s' -Message 'Discord test' -Notify webhook -Webhook discord
+
+            $scriptPath = Join-Path $env:TEMP 'PSTimer_1.ps1'
+            Test-Path -LiteralPath $scriptPath | Should -BeTrue
+            { [scriptblock]::Create((Get-Content -LiteralPath $scriptPath -Raw)) } | Should -Not -Throw
+            $content = Get-Content -LiteralPath $scriptPath -Raw
+            $content | Should -Match '\$timerSeconds'
+            $content | Should -Not -Match '`\$timerSeconds'
+        }
+        finally {
+            $global:Config = $saved
+            $generated = Join-Path $env:TEMP 'PSTimer_1.ps1'
+            if (Test-Path -LiteralPath $generated) { Remove-Item -LiteralPath $generated -Force }
+        }
+    }
+}
+
+Describe "Resolve-TimerNotificationSettings" {
+    It "uses preset notify and webhook" {
+        $saved = $global:Config
+        try {
+            $global:Config = @{
+                TimerDefaults = @{ Notify = 'popup' }
+                Webhooks = @{ 'ntfy' = 'https://ntfy.sh/test' }
+            }
+            $result = Resolve-TimerNotificationSettings -PresetNotify 'webhook' -PresetWebhook 'ntfy'
+            $result.NotifyType | Should -Be 'webhook'
+            $result.WebhookUrl | Should -Be 'https://ntfy.sh/test'
+        }
+        finally {
+            $global:Config = $saved
+        }
     }
 }

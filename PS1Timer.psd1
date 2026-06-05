@@ -11,10 +11,11 @@
 
     FunctionsToExport = @(
         'ConvertFrom-TimerSequence', 'ConvertTo-Seconds', 'Expand-TimerSequence', 'Format-Duration',
-        'Format-RemainingTime', 'Get-AnsiColors', 'Get-SequenceSummary', 'Get-TimerData',
-        'Get-TimerDataIfChanged', 'Get-TimerForWatch', 'Get-TimerListRowColorsForState',
+        'Format-RemainingTime', 'Assert-TimerConfig', 'Get-AnsiColors', 'Get-SequenceSummary', 'Get-TimerData',
+        'Get-TimerDataIfChanged', 'Get-TimerForWatch', 'Get-TimerHistory', 'Get-TimerListRowColorsForState',
         'Get-TimerListRowDisplayData', 'Get-TimerListWatchRowLine', 'Get-TimerNotificationConfig',
-        'Get-TimerNotificationType', 'Get-TimerPickerOptions', 'Get-TimerProgress',
+        'Get-TimerNotificationType', 'Get-TimerPickerOptions', 'Get-TimerProgress', 'Get-TimerStatsSummary',
+        'Parse-TimerAtTime', 'Resolve-TimerNotificationSettings', 'Resolve-TimerWebhookUrl',
         'Get-TimerResumeSeconds', 'Get-TimerStateColor', 'Get-TimerTaskName', 'Get-TimerWatchCompletedContent',
         'Get-TimerWatchPhaseTimelineContent', 'Get-TimerWatchRunningContent', 'Get-TruncatedMessage',
         'Invoke-PauseSingleTimer', 'Invoke-PauseTimersBulk', 'Invoke-RemoveSingleTimer',
@@ -25,12 +26,12 @@
         'Show-TimerToast', 'Show-TimerWatchDisplay', 'Start-SequenceTimer', 'Start-SequenceTimerJob',
         'Start-TimerJob', 'Stop-TimerTask', 'Sync-TimerData', 'Test-TimerIsActiveDisplay',
         'Test-TimerSequence', 'Timer', 'Timer-List', 'Timer-Pause', 'Timer-Presets', 'Timer-Remove',
-        'Timer-Resume', 'Timer-Watch', 'TimerList', 'TimerPause', 'TimerPresets', 'TimerRemove',
-        'TimerResume', 'TimerWatch', 'Wait-OneSecondOrKeyPress', 'Write-HelpMenu',
+        'Timer-Resume', 'Timer-Stats', 'Timer-Watch', 'TimerList', 'TimerPause', 'TimerPresets', 'TimerRemove',
+        'TimerResume', 'TimerStats', 'TimerWatch', 'Wait-OneSecondOrKeyPress', 'Write-HelpMenu',
         'Write-SequenceTimerConfirmation'
     )
 
     CmdletsToExport    = @()
     VariablesToExport  = @()
-    AliasesToExport    = @('t', 'td', 'tl', 'tp', 'tpre', 'tr', 'tw')
+    AliasesToExport    = @('t', 'td', 'tl', 'tp', 'tpre', 'tr', 'ts', 'tw')
 }

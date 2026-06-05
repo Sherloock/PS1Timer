@@ -57,15 +57,15 @@ function Show-MenuPicker {
     $c = Get-AnsiColors
 
     $colorMap = @{
-        'White'      = $c.White
-        'Yellow'     = $c.Yellow
-        'Green'      = $c.Green
-        'Red'        = $c.Red
-        'Cyan'       = $c.Cyan
-        'Magenta'    = $c.Magenta
-        'Gray'       = $c.Gray
+        'White'      = $c.Text
+        'Yellow'     = $c.Warning
+        'Green'      = $c.Success
+        'Red'        = $c.Danger
+        'Cyan'       = $c.Primary
+        'Magenta'    = $c.Accent
+        'Gray'       = $c.Muted
         'DarkGray'   = $c.Dim
-        'DarkYellow' = $c.Yellow
+        'DarkYellow' = $c.Warning
     }
 
     [Console]::CursorVisible = $false
@@ -77,18 +77,18 @@ function Show-MenuPicker {
 
             [void]$sb.AppendLine("")
             if ($Title) {
-                [void]$sb.AppendLine("$($c.Cyan)  $Title$($c.Reset)")
-                [void]$sb.AppendLine("$($c.DarkCyan)  $('-' * $Title.Length)$($c.Reset)")
+                [void]$sb.AppendLine("$($c.Primary)  $Title$($c.Reset)")
+                [void]$sb.AppendLine("$($c.PrimaryMuted)  $('-' * $Title.Length)$($c.Reset)")
             }
             [void]$sb.AppendLine("")
 
             for ($i = 0; $i -lt $optionCount; $i++) {
                 $opt = $Options[$i]
                 $isSelected = ($i -eq $selectedIndex)
-                $baseColorCode = if ($opt.Color -and $colorMap[$opt.Color]) { $colorMap[$opt.Color] } else { $c.White }
+                $baseColorCode = if ($opt.Color -and $colorMap[$opt.Color]) { $colorMap[$opt.Color] } else { $c.Text }
 
                 if ($isSelected) {
-                    [void]$sb.AppendLine("$($c.Cyan)  $selector $($c.Reset)$($c.InvertCyan)$($opt.Label)$($c.Reset)")
+                    [void]$sb.AppendLine("$($c.Primary)  $selector $($c.Reset)$($c.Selected)$($opt.Label)$($c.Reset)")
                     if ($opt.Description) {
                         [void]$sb.AppendLine("      $($c.Dim)$($opt.Description)$($c.Reset)")
                     }
@@ -100,7 +100,7 @@ function Show-MenuPicker {
 
             [void]$sb.AppendLine("")
             $cancelText = if ($AllowCancel) { ", Esc=cancel" } else { "" }
-            [void]$sb.AppendLine("$($c.Yellow)  [Up/Down]$($c.Dim) navigate  $($c.Green)[Enter]$($c.Dim) select$cancelText$($c.Reset)")
+            [void]$sb.AppendLine("$($c.Warning)  [Up/Down]$($c.Dim) navigate  $($c.Success)[Enter]$($c.Dim) select$cancelText$($c.Reset)")
 
             if ($NoClear) {
                 $esc = [char]27
@@ -248,4 +248,302 @@ function Write-HelpMenu {
         }
         Write-Host ""
     }
+}
+
+function Get-TimerSemanticPaletteSlots {
+    return @('Primary', 'PrimaryMuted', 'Text', 'Muted', 'Success', 'Warning', 'Danger', 'Accent', 'Selected')
+}
+
+function Get-TimerNamedColorSgrMap {
+    return @{
+        black         = 30
+        red           = 31
+        green         = 32
+        yellow        = 33
+        blue          = 34
+        magenta       = 35
+        cyan          = 36
+        white         = 37
+        gray          = 90
+        darkgray      = 90
+        brightblack   = 90
+        brightred     = 91
+        brightgreen   = 92
+        brightyellow  = 93
+        brightblue    = 94
+        brightmagenta = 95
+        brightcyan    = 96
+        brightwhite   = 97
+    }
+}
+
+function Get-TimerNamedColorBackgroundSgrMap {
+    return @{
+        black         = 40
+        red           = 41
+        green         = 42
+        yellow        = 43
+        blue          = 44
+        magenta       = 45
+        cyan          = 46
+        white         = 47
+        gray          = 100
+        darkgray      = 100
+        brightblack   = 100
+        brightred     = 41
+        brightgreen   = 42
+        brightyellow  = 43
+        brightblue    = 44
+        brightmagenta = 45
+        brightcyan    = 46
+        brightwhite   = 47
+    }
+}
+
+function Get-DefaultTimerPalettes {
+    <#
+    .SYNOPSIS
+        Built-in palette definitions when Config.Palettes is missing (legacy config.ps1).
+    #>
+    return @{
+        default = @{
+            Description  = 'Balanced colors for everyday use'
+            Primary      = 'cyan'
+            PrimaryMuted = 'cyan'
+            Text         = 'white'
+            Muted        = 'darkgray'
+            Success      = 'green'
+            Warning      = 'yellow'
+            Danger       = 'red'
+            Accent       = 'magenta'
+            Selected     = 'cyan'
+        }
+        minimal = @{
+            Description  = 'Low-contrast gray palette for busy or dim screens'
+            Primary      = 'darkgray'
+            PrimaryMuted = 'darkgray'
+            Text         = 'white'
+            Muted        = 'darkgray'
+            Success      = 'white'
+            Warning      = 'darkgray'
+            Danger       = 'darkgray'
+            Accent       = 'darkgray'
+            Selected     = 'darkgray'
+        }
+        vibrant = @{
+            Description  = 'Bright colors for high-contrast displays'
+            Primary      = 'brightcyan'
+            PrimaryMuted = 'cyan'
+            Text         = 'brightwhite'
+            Muted        = 'darkgray'
+            Success      = 'brightgreen'
+            Warning      = 'brightyellow'
+            Danger       = 'brightred'
+            Accent       = 'brightmagenta'
+            Selected     = 'cyan'
+        }
+        monochrome = @{
+            Description  = 'White and gray only — no hue'
+            Primary      = 'white'
+            PrimaryMuted = 'darkgray'
+            Text         = 'brightwhite'
+            Muted        = 'darkgray'
+            Success      = 'white'
+            Warning      = 'darkgray'
+            Danger       = 'white'
+            Accent       = 'darkgray'
+            Selected     = 'darkgray'
+        }
+    }
+}
+
+function ConvertTo-TimerAnsiForeground {
+    param(
+        [char]$Esc,
+        [string]$ColorName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ColorName)) { return '' }
+
+    $normalized = $ColorName.Trim().ToLower() -replace '\s+', ''
+    if ($normalized.StartsWith($Esc)) { return $ColorName }
+
+    $map = Get-TimerNamedColorSgrMap
+    if (-not $map.ContainsKey($normalized)) { return $ColorName }
+
+    return "$Esc[$($map[$normalized])m"
+}
+
+function ConvertTo-TimerAnsiSelected {
+    param(
+        [char]$Esc,
+        [string]$ColorName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ColorName)) { return '' }
+
+    $normalized = $ColorName.Trim().ToLower() -replace '\s+', ''
+    $bgMap = Get-TimerNamedColorBackgroundSgrMap
+    if (-not $bgMap.ContainsKey($normalized)) { return ConvertTo-TimerAnsiForeground -Esc $Esc -ColorName $ColorName }
+
+    return "$Esc[30;$($bgMap[$normalized])m"
+}
+
+function Test-TimerNamedColor {
+    param([string]$ColorName)
+
+    if ([string]::IsNullOrWhiteSpace($ColorName)) { return $false }
+    $normalized = $ColorName.Trim().ToLower() -replace '\s+', ''
+    return (Get-TimerNamedColorSgrMap).ContainsKey($normalized)
+}
+
+function Resolve-TimerPaletteColors {
+    <#
+    .SYNOPSIS
+        Converts a Config.Palettes entry (semantic roles + named colors) to ANSI escape strings.
+    #>
+    param([hashtable]$PaletteEntry)
+
+    $esc = [char]27
+    $resolved = @{}
+    foreach ($slot in (Get-TimerSemanticPaletteSlots)) {
+        if ($slot -eq 'Selected') {
+            $resolved[$slot] = ConvertTo-TimerAnsiSelected -Esc $esc -ColorName $PaletteEntry[$slot]
+        }
+        else {
+            $resolved[$slot] = ConvertTo-TimerAnsiForeground -Esc $esc -ColorName $PaletteEntry[$slot]
+        }
+    }
+    return $resolved
+}
+
+function Assert-TimerConfig {
+    <#
+    .SYNOPSIS
+        Validates $global:Config after load; warns on invalid values without throwing.
+    #>
+    if (-not $global:Config) { return }
+
+    $validNotify = @('popup', 'toast', 'sound', 'silent', 'webhook')
+    $validAfterStart = @('none', 'watch', 'list')
+    $paletteSource = if ($global:Config.Palettes) { $global:Config.Palettes } else { Get-DefaultTimerPalettes }
+    $validThemes = @($paletteSource.Keys | ForEach-Object { "$_".ToLower() }) | Select-Object -Unique
+    $requiredPaletteSlots = Get-TimerSemanticPaletteSlots
+
+    if ($global:Config.TimerDefaults) {
+        $td = $global:Config.TimerDefaults
+
+        if ($td.Notify -and ($validNotify -notcontains $td.Notify.ToLower())) {
+            Write-Warning "PS1Timer: TimerDefaults.Notify '$($td.Notify)' is invalid. Use: $($validNotify -join ', ')"
+        }
+
+        if ($td.AfterStart -and ($validAfterStart -notcontains $td.AfterStart)) {
+            Write-Warning "PS1Timer: TimerDefaults.AfterStart '$($td.AfterStart)' is invalid. Use: $($validAfterStart -join ', ')"
+        }
+
+        if ($td.Theme -and ($validThemes -notcontains $td.Theme.ToLower())) {
+            Write-Warning "PS1Timer: TimerDefaults.Theme '$($td.Theme)' not found in Config.Palettes. Available: $($validThemes -join ', ')"
+        }
+
+        if ($td.Notify -eq 'webhook' -or $td.Webhook) {
+            $name = $td.Webhook
+            if ([string]::IsNullOrWhiteSpace($name)) {
+                if ($td.Notify -eq 'webhook') {
+                    Write-Warning 'PS1Timer: TimerDefaults.Notify is webhook but TimerDefaults.Webhook name is not set.'
+                }
+            }
+            elseif (-not (Resolve-TimerWebhookUrl -Name $name)) {
+                Write-Warning "PS1Timer: Webhook '$name' not found in Config.Webhooks."
+            }
+        }
+
+        if ($td.SoundFile -and -not (Test-Path -LiteralPath $td.SoundFile)) {
+            Write-Warning "PS1Timer: SoundFile not found: $($td.SoundFile)"
+        }
+    }
+
+    if ($global:Config.Webhooks) {
+        foreach ($key in $global:Config.Webhooks.Keys) {
+            $url = $global:Config.Webhooks[$key]
+            if ([string]::IsNullOrWhiteSpace($url)) {
+                Write-Warning "PS1Timer: Webhooks['$key'] is empty."
+                continue
+            }
+            $uri = $null
+            if (-not [Uri]::TryCreate($url, [UriKind]::Absolute, [ref]$uri)) {
+                Write-Warning "PS1Timer: Webhooks['$key'] is not a valid URL."
+            }
+        }
+    }
+
+    if (-not $global:Config.Palettes) {
+        Write-Warning 'PS1Timer: Config.Palettes is missing. Copy the Palettes block from config.example.ps1. Using built-in defaults.'
+    }
+    elseif ($global:Config.Palettes) {
+        foreach ($paletteName in $global:Config.Palettes.Keys) {
+            $palette = $global:Config.Palettes[$paletteName]
+            foreach ($slot in $requiredPaletteSlots) {
+                if (-not $palette.ContainsKey($slot) -or $null -eq $palette[$slot]) {
+                    Write-Warning "PS1Timer: Palettes['$paletteName'] is missing required role '$slot'."
+                    continue
+                }
+                if (-not (Test-TimerNamedColor -ColorName $palette[$slot])) {
+                    Write-Warning "PS1Timer: Palettes['$paletteName'].$slot '$($palette[$slot])' is not a recognized color name."
+                }
+            }
+        }
+    }
+
+    if ($global:Config.Presets) {
+        foreach ($presetName in $global:Config.Presets.Keys) {
+            $preset = $global:Config.Presets[$presetName]
+            if ($preset.Notify -and ($validNotify -notcontains $preset.Notify.ToLower())) {
+                Write-Warning "PS1Timer: Presets['$presetName'].Notify '$($preset.Notify)' is invalid."
+            }
+            if ($preset.Webhook -and -not (Resolve-TimerWebhookUrl -Name $preset.Webhook)) {
+                Write-Warning "PS1Timer: Presets['$presetName'].Webhook '$($preset.Webhook)' not found in Config.Webhooks."
+            }
+        }
+    }
+}
+
+function Resolve-TimerWebhookUrl {
+    <#
+    .SYNOPSIS
+        Resolves a named webhook from Config.Webhooks to its URL.
+    #>
+    param([string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
+    if (-not $global:Config -or -not $global:Config.Webhooks) { return $null }
+
+    $webhooks = $global:Config.Webhooks
+    if ($webhooks.ContainsKey($Name)) {
+        return [string]$webhooks[$Name]
+    }
+
+    return $null
+}
+
+function Parse-TimerAtTime {
+    <#
+    .SYNOPSIS
+        Parses HH:mm (24h) into today's DateTime, or $null if invalid/past.
+    #>
+    param(
+        [string]$At,
+        [DateTime]$Now = (Get-Date)
+    )
+
+    if ([string]::IsNullOrWhiteSpace($At)) { return $null }
+    if ($At -notmatch '^(\d{1,2}):(\d{2})$') { return $null }
+
+    $hour = [int]$matches[1]
+    $minute = [int]$matches[2]
+    if ($hour -gt 23 -or $minute -gt 59) { return $null }
+
+    $scheduled = [DateTime]::new($Now.Year, $Now.Month, $Now.Day, $hour, $minute, 0)
+    if ($scheduled -le $Now) { return $null }
+
+    return $scheduled
 }
