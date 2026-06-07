@@ -523,14 +523,14 @@ function Get-AnsiColors {
     #>
     $esc = [char]27
     $theme = 'default'
-    if ($global:Config -and $global:Config.TimerDefaults -and $global:Config.TimerDefaults.Theme) {
-        $theme = $global:Config.TimerDefaults.Theme.ToLower()
+    $timerDefaults = Get-PS1TimerModuleTimerDefaults
+    if ($timerDefaults.Theme) {
+        $theme = $timerDefaults.Theme.ToLower()
     }
 
-    $palettes = if ($global:Config -and $global:Config.Palettes) {
-        $global:Config.Palettes
-    } else {
-        Get-DefaultTimerPalettes
+    $palettes = Get-PS1TimerModulePalettes
+    if (-not $palettes) {
+        $palettes = Get-DefaultTimerPalettes
     }
 
     $paletteEntry = if ($palettes.ContainsKey($theme)) { $palettes[$theme] } else { $palettes['default'] }
@@ -1147,12 +1147,10 @@ function Get-TimerNotificationConfig {
         SoundFile = $null
     }
 
-    if ($global:Config -and $global:Config.TimerDefaults) {
-        $config = $global:Config.TimerDefaults
-        if ($config.Notify) { $defaults.Notify = $config.Notify }
-        if ($config.Webhook) { $defaults.Webhook = $config.Webhook }
-        if ($config.SoundFile) { $defaults.SoundFile = $config.SoundFile }
-    }
+    $config = Get-PS1TimerModuleTimerDefaults
+    if ($config.Notify) { $defaults.Notify = $config.Notify }
+    if ($config.Webhook) { $defaults.Webhook = $config.Webhook }
+    if ($config.SoundFile) { $defaults.SoundFile = $config.SoundFile }
 
     return $defaults
 }
@@ -1284,11 +1282,9 @@ function Get-TimerAfterStartAction {
     if ($Override -and ($valid -contains $Override)) {
         return $Override
     }
-    if ($global:Config -and $global:Config.TimerDefaults -and $global:Config.TimerDefaults.AfterStart) {
-        $configured = $global:Config.TimerDefaults.AfterStart
-        if ($valid -contains $configured) {
-            return $configured
-        }
+    $timerDefaults = Get-PS1TimerModuleTimerDefaults
+    if ($timerDefaults.AfterStart -and ($valid -contains $timerDefaults.AfterStart)) {
+        return $timerDefaults.AfterStart
     }
     return 'none'
 }
@@ -2695,7 +2691,7 @@ function Write-SequenceTimerConfirmation {
         [int]$PhaseCount,
         [object]$FirstPhase,
         [DateTime]$EndTime,
-        [DateTime]$ScheduledStart = $null,
+        [Nullable[DateTime]]$ScheduledStart,
         [string]$NotifyLabel = $null,
         [string]$WebhookName = $null
     )

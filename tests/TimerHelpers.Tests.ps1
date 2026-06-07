@@ -324,11 +324,13 @@ Describe "Module configuration loading" {
         try {
             $global:Config = @{}
             . (Join-Path $ModuleRoot 'config.example.ps1')
+            Initialize-PS1TimerModuleConfig
             $cfg = Get-TimerNotificationConfig
-            $cfg.Notify | Should -Be 'popup'
+            $cfg.Notify | Should -Be 'sound'
         }
         finally {
             $global:Config = $saved
+            Initialize-PS1TimerModuleConfig
         }
     }
 }
@@ -345,6 +347,23 @@ Describe "Resolve-TimerWebhookUrl" {
         }
         finally {
             $global:Config = $saved
+        }
+    }
+
+    It "keeps module snapshot when $global:Config is replaced" {
+        $saved = $global:Config
+        try {
+            $global:Config = @{
+                Webhooks = @{ 'discord-main' = 'https://example.com/hook' }
+            }
+            Initialize-PS1TimerModuleConfig
+            $global:Config = @{ TimerDefaults = @{ Notify = 'popup' } }
+
+            Resolve-TimerWebhookUrl -Name 'discord-main' | Should -Be 'https://example.com/hook'
+        }
+        finally {
+            $global:Config = $saved
+            Initialize-PS1TimerModuleConfig
         }
     }
 }

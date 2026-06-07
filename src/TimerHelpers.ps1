@@ -417,6 +417,70 @@ function Resolve-TimerPaletteColors {
     return $resolved
 }
 
+$script:PS1TimerModuleConfig = @{
+    TimerDefaults = @{}
+    Webhooks      = @{}
+    Palettes      = $null
+}
+
+function Initialize-PS1TimerModuleConfig {
+    <#
+    .SYNOPSIS
+        Snapshots timer config at module import so other toolkits cannot overwrite Webhooks via $global:Config.
+    #>
+    $script:PS1TimerModuleConfig = @{
+        TimerDefaults = @{}
+        Webhooks      = @{}
+        Palettes      = $null
+    }
+
+    if (-not $global:Config) { return }
+
+    if ($global:Config.TimerDefaults) {
+        foreach ($key in $global:Config.TimerDefaults.Keys) {
+            $script:PS1TimerModuleConfig.TimerDefaults[$key] = $global:Config.TimerDefaults[$key]
+        }
+    }
+    if ($global:Config.Webhooks) {
+        foreach ($key in $global:Config.Webhooks.Keys) {
+            $script:PS1TimerModuleConfig.Webhooks[$key] = $global:Config.Webhooks[$key]
+        }
+    }
+    if ($global:Config.Palettes) {
+        $script:PS1TimerModuleConfig.Palettes = $global:Config.Palettes
+    }
+}
+
+function Get-PS1TimerModuleTimerDefaults {
+    if ($script:PS1TimerModuleConfig.TimerDefaults.Count -gt 0) {
+        return $script:PS1TimerModuleConfig.TimerDefaults
+    }
+    if ($global:Config -and $global:Config.TimerDefaults) {
+        return $global:Config.TimerDefaults
+    }
+    return @{}
+}
+
+function Get-PS1TimerModuleWebhooks {
+    if ($script:PS1TimerModuleConfig.Webhooks.Count -gt 0) {
+        return $script:PS1TimerModuleConfig.Webhooks
+    }
+    if ($global:Config -and $global:Config.Webhooks) {
+        return $global:Config.Webhooks
+    }
+    return @{}
+}
+
+function Get-PS1TimerModulePalettes {
+    if ($script:PS1TimerModuleConfig.Palettes) {
+        return $script:PS1TimerModuleConfig.Palettes
+    }
+    if ($global:Config -and $global:Config.Palettes) {
+        return $global:Config.Palettes
+    }
+    return $null
+}
+
 function Assert-TimerConfig {
     <#
     .SYNOPSIS
@@ -515,9 +579,8 @@ function Resolve-TimerWebhookUrl {
     param([string]$Name)
 
     if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
-    if (-not $global:Config -or -not $global:Config.Webhooks) { return $null }
-
-    $webhooks = $global:Config.Webhooks
+    $webhooks = Get-PS1TimerModuleWebhooks
+    if (-not $webhooks -or $webhooks.Count -eq 0) { return $null }
     if ($webhooks.ContainsKey($Name)) {
         return [string]$webhooks[$Name]
     }

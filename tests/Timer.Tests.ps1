@@ -895,6 +895,12 @@ Describe "Fire script generation" {
     }
 }
 
+Describe "Write-SequenceTimerConfirmation" {
+    It "accepts null ScheduledStart for immediate sequence starts" {
+        { Write-SequenceTimerConfirmation -Id 'abc' -OriginalPattern 'water' -Summary ([PSCustomObject]@{ TotalDuration = '15h' }) -PhaseCount 20 -FirstPhase @{ Seconds = 2700; Label = 'water' } -EndTime (Get-Date).AddMinutes(45) -ScheduledStart $null -NotifyLabel 'popup' } | Should -Not -Throw
+    }
+}
+
 Describe "Resolve-TimerNotificationSettings" {
     It "uses preset notify and webhook" {
         $saved = $global:Config

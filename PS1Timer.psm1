@@ -14,12 +14,14 @@ if (Test-Path -LiteralPath $configPath) {
 }
 
 . (Join-Path $script:PS1TimerRoot 'src\TimerHelpers.ps1')
+Initialize-PS1TimerModuleConfig
 Assert-TimerConfig
 . (Join-Path $script:PS1TimerRoot 'src\Timer.ps1')
 
 $quietLoad = $false
-if ($global:Config -and $global:Config.TimerDefaults -and $global:Config.TimerDefaults.QuietLoad) {
-    $quietLoad = [bool]$global:Config.TimerDefaults.QuietLoad
+$timerDefaults = Get-PS1TimerModuleTimerDefaults
+if ($timerDefaults.QuietLoad) {
+    $quietLoad = [bool]$timerDefaults.QuietLoad
 }
 if (-not $quietLoad) {
     Write-Host 'PS1Timer loaded — type t or Timer for help' -ForegroundColor Green
