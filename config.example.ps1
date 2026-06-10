@@ -45,7 +45,7 @@ $global:Config = @{
         Sound   = $true
         Webhook = $null
 
-        # SoundFile — optional .wav when Sound = $true (null = built-in beep)
+        # SoundFile — name from Sounds below, raw .wav path, or $null (built-in beep)
         SoundFile = $null
 
         # UI theme — name from Palettes below (default | minimal | vibrant | monochrome | your own)
@@ -122,6 +122,25 @@ $global:Config = @{
     Webhooks = @{
         # 'discord-main' = 'https://discord.com/api/webhooks/...'
         # 'ntfy-phone'   = 'https://ntfy.sh/my-topic'
+    }
+
+    # Sounds — Windows Media .wav presets; reference via TimerDefaults.SoundFile = 'notify'
+    # Preview: Resolve-TimerSoundFilePath -Name 'notify' | % { (New-Object System.Media.SoundPlayer $_).PlaySync() }
+    Sounds = @{
+        notify            = "$env:windir\Media\notify.wav"
+        ding              = "$env:windir\Media\ding.wav"
+        chimes            = "$env:windir\Media\chimes.wav"
+        chord             = "$env:windir\Media\chord.wav"
+        'win-notify'      = "$env:windir\Media\Windows Notify.wav"
+        'win-ding'        = "$env:windir\Media\Windows Ding.wav"
+        tada              = "$env:windir\Media\tada.wav"
+        'alarm-soft'      = "$env:windir\Media\Alarm01.wav"
+        'alarm-loud'      = "$env:windir\Media\Alarm06.wav"
+        ring              = "$env:windir\Media\Ring01.wav"
+        'win-calendar'    = "$env:windir\Media\Windows Notify Calendar.wav"
+        'win-email'       = "$env:windir\Media\Windows Notify Email.wav"
+        'win-exclamation' = "$env:windir\Media\Windows Exclamation.wav"
+        'win-critical'    = "$env:windir\Media\Windows Critical Stop.wav"
     }
 
     # Presets — sequence patterns by name (t pomodoro, tpre)

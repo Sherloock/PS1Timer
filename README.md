@@ -109,7 +109,7 @@ Works out of the box — no copy step required.
 | [`config.example.ps1`](config.example.ps1) | Defaults + **19 presets** — loaded automatically when `config.ps1` is absent |
 | `config.ps1` | Optional personal settings (gitignored) — **replaces** the example when present |
 
-`TimerDefaults` keys: `Visual` (`popup` | `toast` | `none`), `Sound` (`$true` | `$false`), `Webhook`, `SoundFile`, `Theme`, `AfterStart` (`none` | `watch` | `list`). Legacy `Notify` still maps to Visual/Sound. `Theme` selects a palette from `Palettes`. Named URLs live in `Webhooks` (e.g. `discord-main`).
+`TimerDefaults` keys: `Visual` (`popup` | `toast` | `none`), `Sound` (`$true` | `$false`), `Webhook`, `SoundFile` (name from `Sounds` or raw `.wav` path), `Theme`, `AfterStart` (`none` | `watch` | `list`). Legacy `Notify` still maps to Visual/Sound. `Theme` selects a palette from `Palettes`. Named URLs live in `Webhooks` (e.g. `discord-main`). Named sounds live in `Sounds` (e.g. `notify`, `ding`, `alarm-soft`).
 
 To customize:
 

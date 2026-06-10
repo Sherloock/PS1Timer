@@ -231,6 +231,14 @@ Describe "Format-RemainingTime" {
     It "returns 00:00:00 for negative TimeSpan" {
         Format-RemainingTime -Remaining ([TimeSpan]::FromSeconds(-100)) | Should -Be "00:00:00"
     }
+
+    It "ceilings sub-second remainders to 1 second" {
+        Format-RemainingTime -Remaining ([TimeSpan]::FromSeconds(0.6)) | Should -Be "00:00:01"
+    }
+
+    It "returns 00:00:00 for zero remainder" {
+        Format-RemainingTime -Remaining ([TimeSpan]::Zero) | Should -Be "00:00:00"
+    }
 }
 
 Describe "Get-TimerStateColor" {
@@ -251,6 +259,20 @@ Describe "Get-TimerProgress" {
     It "calculates progress for Paused timer" {
         $timer = [PSCustomObject]@{ State = "Paused"; Seconds = 100; RemainingSeconds = 25 }
         Get-TimerProgress -Timer $timer | Should -Be 75
+    }
+
+    It "uses EndTime window for Running timer after resume" {
+        $start = [DateTime]::new(2024, 1, 1, 12, 0, 0)
+        $end = $start.AddSeconds(88)
+        $now = $start.AddSeconds(44)
+        Mock Get-Date { return $now }
+        $timer = [PSCustomObject]@{
+            State     = "Running"
+            Seconds   = 100
+            StartTime = $start.ToString('o')
+            EndTime   = $end.ToString('o')
+        }
+        Get-TimerProgress -Timer $timer | Should -Be 50
     }
 }
 
@@ -334,6 +356,22 @@ Describe "Module configuration loading" {
             Initialize-PS1TimerModuleConfig
         }
     }
+
+    It "resolves SoundFile name to path from config.example.ps1" {
+        $saved = $global:Config
+        try {
+            $global:Config = @{}
+            . (Join-Path $ModuleRoot 'config.example.ps1')
+            $global:Config.TimerDefaults.SoundFile = 'notify'
+            Initialize-PS1TimerModuleConfig
+            $cfg = Get-TimerNotificationConfig
+            $cfg.SoundFile | Should -Be (Join-Path $env:windir 'Media\notify.wav')
+        }
+        finally {
+            $global:Config = $saved
+            Initialize-PS1TimerModuleConfig
+        }
+    }
 }
 
 Describe "ConvertFrom-LegacyNotifyMode" {
@@ -347,6 +385,56 @@ Describe "ConvertFrom-LegacyNotifyMode" {
         $result = ConvertFrom-LegacyNotifyMode -Notify 'silent'
         $result.Visual | Should -Be 'none'
         $result.Sound | Should -BeFalse
+    }
+}
+
+Describe "Resolve-TimerSoundFilePath" {
+    It "resolves named sound from config" {
+        $saved = $global:Config
+        try {
+            $global:Config = @{
+                Sounds = @{ notify = 'C:\Windows\Media\notify.wav' }
+            }
+            Initialize-PS1TimerModuleConfig
+            Resolve-TimerSoundFilePath -Name 'notify' | Should -Be 'C:\Windows\Media\notify.wav'
+            Resolve-TimerSoundFilePath -Name 'missing' | Should -BeNullOrEmpty
+        }
+        finally {
+            $global:Config = $saved
+            Initialize-PS1TimerModuleConfig
+        }
+    }
+
+    It "passes through existing raw path when not a Sounds key" {
+        $saved = $global:Config
+        try {
+            $global:Config = @{ Sounds = @{ notify = 'C:\Windows\Media\notify.wav' } }
+            Initialize-PS1TimerModuleConfig
+            $testDriveWav = Join-Path $TestDrive 'custom.wav'
+            New-Item -ItemType File -Path $testDriveWav -Force | Out-Null
+            Resolve-TimerSoundFilePath -Name $testDriveWav | Should -Be $testDriveWav
+        }
+        finally {
+            $global:Config = $saved
+            Initialize-PS1TimerModuleConfig
+        }
+    }
+
+    It "keeps module snapshot when global Config is replaced" {
+        $saved = $global:Config
+        try {
+            $global:Config = @{
+                Sounds = @{ ding = 'C:\Windows\Media\ding.wav' }
+            }
+            Initialize-PS1TimerModuleConfig
+            $global:Config = @{ TimerDefaults = @{ Notify = 'popup' } }
+
+            Resolve-TimerSoundFilePath -Name 'ding' | Should -Be 'C:\Windows\Media\ding.wav'
+        }
+        finally {
+            $global:Config = $saved
+            Initialize-PS1TimerModuleConfig
+        }
     }
 }
 

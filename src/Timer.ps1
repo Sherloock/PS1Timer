@@ -573,7 +573,14 @@ function Format-RemainingTime {
     if ($Remaining.TotalSeconds -lt 0) {
         return "00:00:00"
     }
-    return "{0:D2}:{1:D2}:{2:D2}" -f [int]$Remaining.Hours, $Remaining.Minutes, $Remaining.Seconds
+    $totalSecs = [math]::Ceiling($Remaining.TotalSeconds)
+    if ($totalSecs -le 0) {
+        return "00:00:00"
+    }
+    $hours = [int][math]::Floor($totalSecs / 3600)
+    $mins = [int][math]::Floor(($totalSecs % 3600) / 60)
+    $secs = [int]($totalSecs % 60)
+    return "{0:D2}:{1:D2}:{2:D2}" -f $hours, $mins, $secs
 }
 
 function Get-TimerStateColor {
@@ -652,12 +659,18 @@ function Get-TimerProgress {
 
     $now = Get-Date
     $startTime = [DateTime]::Parse($Timer.StartTime)
+    if ($Timer.EndTime) {
+        $endTime = [DateTime]::Parse($Timer.EndTime)
+        if ($now -ge $endTime) { return [double]100 }
+        $total = ($endTime - $startTime).TotalSeconds
+        if ($total -le 0) { return [double]100 }
+        $elapsed = ($now - $startTime).TotalSeconds
+        return [math]::Min(100.0, [math]::Max(0.0, ($elapsed / $total) * 100))
+    }
+
     $elapsed = ($now - $startTime).TotalSeconds
-
     $percent = ([double]$elapsed / $Timer.Seconds) * 100
-    $percent = [math]::Min(100.0, [math]::Max(0.0, $percent))
-
-    return $percent
+    return [math]::Min(100.0, [math]::Max(0.0, $percent))
 }
 
 function Get-TimerFinalEndTime {
@@ -1001,9 +1014,10 @@ function Get-TimerWatchRunningContent {
         [PSCustomObject]$Timer,
         [double]$Percent,
         [TimeSpan]$Remaining,
-        [string]$EndsAtFormatted
+        [string]$EndsAtFormatted,
+        [switch]$Finishing
     )
-    $remainingStr = Format-RemainingTime -Remaining $Remaining
+    $remainingStr = if ($Finishing) { 'Finishing...' } else { Format-RemainingTime -Remaining $Remaining }
     $waiting = $false
     $c = $Colors
     $sb = [System.Text.StringBuilder]::new()
@@ -1155,7 +1169,7 @@ function Get-TimerNotificationConfig {
         Visual    = $channels.Visual
         Sound     = $channels.Sound
         Webhook   = if ($config.Webhook) { $config.Webhook } else { $null }
-        SoundFile = if ($config.SoundFile) { $config.SoundFile } else { $null }
+        SoundFile = if ($config.SoundFile) { Resolve-TimerSoundFilePath -Name $config.SoundFile } else { $null }
         Notify    = if ($config.Notify) { $config.Notify } else { $null }
     }
 }
@@ -1698,9 +1712,17 @@ function Show-TimerNotificationHelp {
     Write-Host "        Visual  = 'toast'" -ForegroundColor Gray
     Write-Host "        Sound   = `$true" -ForegroundColor Gray
     Write-Host "        Webhook = 'discord-main'" -ForegroundColor Gray
-    Write-Host "        SoundFile = 'C:\\path\\to\\sound.wav'" -ForegroundColor Gray
+    Write-Host "        SoundFile = 'notify'             # name from Sounds" -ForegroundColor Gray
     Write-Host "    }" -ForegroundColor Gray
     Write-Host ""
+    $sounds = Get-PS1TimerModuleSounds
+    if ($sounds -and $sounds.Count -gt 0) {
+        Write-Host "  Available sounds (Config.Sounds):" -ForegroundColor Yellow
+        foreach ($name in ($sounds.Keys | Sort-Object)) {
+            Write-Host "    $name" -ForegroundColor Green
+        }
+        Write-Host ""
+    }
 }
 # endregion Timer-Notifications.ps1
 
@@ -1878,7 +1900,7 @@ function Start-TimerJob {
         $WebhookUrl = Resolve-TimerWebhookUrl -Name $Timer.WebhookName
     }
 
-    $triggerTime = if ($Timer.State -eq 'Scheduled') {
+    $triggerTime = if ($Timer.EndTime) {
         [DateTime]::Parse($Timer.EndTime)
     } else {
         (Get-Date).AddSeconds($Timer.Seconds)
@@ -2869,7 +2891,7 @@ function Start-SequenceTimerJob {
     $webhookUrl = if ($Timer.WebhookName) { Resolve-TimerWebhookUrl -Name $Timer.WebhookName } else { $null }
     $soundFile = (Get-TimerNotificationConfig).SoundFile
 
-    $triggerTime = if ($Timer.State -eq 'Scheduled') {
+    $triggerTime = if ($Timer.EndTime) {
         [DateTime]::Parse($Timer.EndTime)
     } else {
         (Get-Date).AddSeconds($Timer.Seconds)
@@ -3591,6 +3613,47 @@ function Timer-Watch {
     Show-TimerWatchDisplay -Timer $result.Timer
 }
 
+function Test-TimerWatchAwaitingContinuation {
+    <#
+    .SYNOPSIS
+        True when watch should poll for a repeat run or next sequence phase after EndTime.
+    #>
+    param([PSCustomObject]$Timer)
+
+    if ($Timer.IsSequence) {
+        $currentPhase = [int]$Timer.CurrentPhase
+        $totalPhases = if ($null -ne $Timer.TotalPhases) { [int]$Timer.TotalPhases } else { 0 }
+        return ($currentPhase + 1) -lt $totalPhases
+    }
+
+    $repeatRemaining = if ($null -ne $Timer.RepeatRemaining) { [int]$Timer.RepeatRemaining } else { 0 }
+    return $repeatRemaining -gt 0
+}
+
+function Write-TimerWatchCompletedScreen {
+    param(
+        [hashtable]$Colors,
+        [PSCustomObject]$CurrentTimer,
+        [PSCustomObject]$Timer,
+        [int]$TotalSeconds,
+        [DateTime]$EndTime
+    )
+
+    $msg = if ($CurrentTimer) {
+        if ($CurrentTimer.IsSequence) { $CurrentTimer.PhaseLabel } else { $CurrentTimer.Message }
+    } else {
+        $Timer.Message
+    }
+    $secs = if ($CurrentTimer) {
+        if ($CurrentTimer.IsSequence) { $CurrentTimer.Seconds } else { $CurrentTimer.Seconds }
+    } else {
+        $TotalSeconds
+    }
+    Clear-Host
+    $sb = Get-TimerWatchCompletedContent -Colors $Colors -Message $msg -TotalSeconds $secs -EndTime $EndTime
+    [Console]::Write($sb.ToString())
+}
+
 function Show-TimerWatchDisplay {
     <#
     .SYNOPSIS
@@ -3632,16 +3695,35 @@ function Show-TimerWatchDisplay {
             $percent = Get-TimerProgress -Timer $currentTimer
 
             if ($remainingSeconds -le 0) {
-                # Poll for next run/phase: scheduled task runs in separate process and may need several seconds to write updated JSON
+                if (-not (Test-TimerWatchAwaitingContinuation -Timer $currentTimer)) {
+                    Write-TimerWatchCompletedScreen -Colors $c -CurrentTimer $currentTimer -Timer $Timer -TotalSeconds $totalSeconds -EndTime $endTime
+                    break
+                }
+
                 $foundNextRun = $false
                 $pollMs = @(500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000)
                 foreach ($delay in $pollMs) {
+                    $endsAtStr = $endTime.ToString('HH:mm:ss')
+                    $sb = Get-TimerWatchRunningContent -Colors $c -CurrentTimer $currentTimer -Timer $Timer -Percent 100 -Remaining ([TimeSpan]::Zero) -EndsAtFormatted $endsAtStr -Finishing
+                    $phaseSb = Get-TimerWatchPhaseTimelineContent -Colors $c -CurrentTimer $currentTimer
+                    if ($phaseSb) {
+                        [void]$sb.Append($phaseSb.ToString())
+                    }
+                    [void]$sb.AppendLine("")
+                    [void]$sb.AppendLine("$($c.Dim)  Press any key to exit watch mode...$($c.Reset)")
+                    Clear-Host
+                    [Console]::Write($sb.ToString())
+
                     Start-Sleep -Milliseconds $delay
                     $refresh = Get-TimerDataIfChanged -Force
                     $refreshed = @($refresh.Data | Where-Object { [string]$_.Id -eq [string]$Timer.Id })[0]
+                    if ($refreshed -and $refreshed.State -eq 'Completed') {
+                        $currentTimer = $refreshed
+                        break
+                    }
                     if ($refreshed -and $refreshed.State -eq 'Running' -and $refreshed.EndTime) {
                         $refreshedEnd = [DateTime]::Parse($refreshed.EndTime)
-                        if ($refreshedEnd -gt $now) {
+                        if ($refreshedEnd -gt (Get-Date)) {
                             $currentTimer = $refreshed
                             $endTime = $refreshedEnd
                             $totalSeconds = if ($refreshed.IsSequence) { $refreshed.TotalSeconds } else { $refreshed.Seconds }
@@ -3651,12 +3733,7 @@ function Show-TimerWatchDisplay {
                     }
                 }
                 if ($foundNextRun) { continue }
-                # Truly completed or stopped: show completed and exit
-                $msg = if ($currentTimer) { if ($currentTimer.IsSequence) { $currentTimer.PhaseLabel } else { $currentTimer.Message } } else { $Timer.Message }
-                $secs = if ($currentTimer) { if ($currentTimer.IsSequence) { $currentTimer.Seconds } else { $currentTimer.Seconds } } else { $totalSeconds }
-                Clear-Host
-                $sb = Get-TimerWatchCompletedContent -Colors $c -Message $msg -TotalSeconds $secs -EndTime $endTime
-                [Console]::Write($sb.ToString())
+                Write-TimerWatchCompletedScreen -Colors $c -CurrentTimer $currentTimer -Timer $Timer -TotalSeconds $totalSeconds -EndTime $endTime
                 break
             }
 

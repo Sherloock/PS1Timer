@@ -420,6 +420,7 @@ function Resolve-TimerPaletteColors {
 $script:PS1TimerModuleConfig = @{
     TimerDefaults = @{}
     Webhooks      = @{}
+    Sounds        = @{}
     Palettes      = $null
 }
 
@@ -431,6 +432,7 @@ function Initialize-PS1TimerModuleConfig {
     $script:PS1TimerModuleConfig = @{
         TimerDefaults = @{}
         Webhooks      = @{}
+        Sounds        = @{}
         Palettes      = $null
     }
 
@@ -444,6 +446,11 @@ function Initialize-PS1TimerModuleConfig {
     if ($global:Config.Webhooks) {
         foreach ($key in $global:Config.Webhooks.Keys) {
             $script:PS1TimerModuleConfig.Webhooks[$key] = $global:Config.Webhooks[$key]
+        }
+    }
+    if ($global:Config.Sounds) {
+        foreach ($key in $global:Config.Sounds.Keys) {
+            $script:PS1TimerModuleConfig.Sounds[$key] = $global:Config.Sounds[$key]
         }
     }
     if ($global:Config.Palettes) {
@@ -467,6 +474,16 @@ function Get-PS1TimerModuleWebhooks {
     }
     if ($global:Config -and $global:Config.Webhooks) {
         return $global:Config.Webhooks
+    }
+    return @{}
+}
+
+function Get-PS1TimerModuleSounds {
+    if ($script:PS1TimerModuleConfig.Sounds.Count -gt 0) {
+        return $script:PS1TimerModuleConfig.Sounds
+    }
+    if ($global:Config -and $global:Config.Sounds) {
+        return $global:Config.Sounds
     }
     return @{}
 }
@@ -611,8 +628,28 @@ function Assert-TimerConfig {
             }
         }
 
-        if ($td.SoundFile -and -not (Test-Path -LiteralPath $td.SoundFile)) {
-            Write-Warning "PS1Timer: SoundFile not found: $($td.SoundFile)"
+        if ($td.SoundFile) {
+            $resolvedSound = Resolve-TimerSoundFilePath -Name $td.SoundFile
+            if (-not $resolvedSound) {
+                Write-Warning "PS1Timer: SoundFile '$($td.SoundFile)' not found in Config.Sounds and is not a valid path."
+            }
+            elseif (-not (Test-Path -LiteralPath $resolvedSound)) {
+                Write-Warning "PS1Timer: SoundFile resolved path not found: $resolvedSound"
+            }
+        }
+    }
+
+    $sounds = Get-PS1TimerModuleSounds
+    if ($sounds) {
+        foreach ($key in $sounds.Keys) {
+            $path = $sounds[$key]
+            if ([string]::IsNullOrWhiteSpace($path)) {
+                Write-Warning "PS1Timer: Sounds['$key'] is empty."
+                continue
+            }
+            if (-not (Test-Path -LiteralPath $path)) {
+                Write-Warning "PS1Timer: Sounds['$key'] path not found: $path"
+            }
         }
     }
 
@@ -676,6 +713,27 @@ function Resolve-TimerWebhookUrl {
     if (-not $webhooks -or $webhooks.Count -eq 0) { return $null }
     if ($webhooks.ContainsKey($Name)) {
         return [string]$webhooks[$Name]
+    }
+
+    return $null
+}
+
+function Resolve-TimerSoundFilePath {
+    <#
+    .SYNOPSIS
+        Resolves a named sound from Config.Sounds to a .wav path, or returns an existing file path.
+    #>
+    param([string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
+
+    $sounds = Get-PS1TimerModuleSounds
+    if ($sounds -and $sounds.ContainsKey($Name)) {
+        return [string]$sounds[$Name]
+    }
+
+    if (Test-Path -LiteralPath $Name) {
+        return $Name
     }
 
     return $null

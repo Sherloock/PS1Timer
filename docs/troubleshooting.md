@@ -55,7 +55,7 @@ Get-ScheduledTask | Where-Object TaskName -like 'PSTimer_*' | Unregister-Schedul
 1. Confirm mode: `t 1m -Notify popup` for a quick test.
 2. Check Focus Assist / Do Not Disturb on Windows.
 3. Toast mode requires a user session; headless SSH sessions may not show UI.
-4. For `sound`, verify `SoundFile` path exists if configured.
+4. For `sound`, verify `SoundFile` name exists in `Config.Sounds` or the resolved `.wav` path exists.
 
 ## Permission errors registering tasks
 

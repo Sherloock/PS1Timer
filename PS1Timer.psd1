@@ -15,7 +15,7 @@
         'Get-TimerDataIfChanged', 'Get-TimerForWatch', 'Get-TimerHistory', 'Get-TimerListRowColorsForState',
         'Get-TimerListRowDisplayData', 'Get-TimerListWatchRowLine', 'Get-TimerNotificationConfig',
         'Get-TimerNotificationType', 'Get-TimerPickerOptions', 'Get-TimerProgress', 'Get-TimerStatsSummary',
-        'Parse-TimerAtTime', 'Resolve-TimerNotificationSettings', 'Resolve-TimerWebhookUrl',
+        'Parse-TimerAtTime', 'Resolve-TimerNotificationSettings', 'Resolve-TimerSoundFilePath', 'Resolve-TimerWebhookUrl',
         'Get-TimerResumeSeconds', 'Get-TimerStateColor', 'Get-TimerTaskName', 'Get-TimerWatchCompletedContent',
         'Get-TimerWatchPhaseTimelineContent', 'Get-TimerWatchRunningContent', 'Get-TruncatedMessage',
         'Invoke-PauseSingleTimer', 'Invoke-PauseTimersBulk', 'Invoke-RemoveSingleTimer',

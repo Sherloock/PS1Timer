@@ -765,6 +765,108 @@ Describe "Show-TimerWatchDisplay" {
         Assert-MockCalled -CommandName Get-TimerWatchCompletedContent -Times 0 -Exactly
         Assert-MockCalled -CommandName Get-TimerDataIfChanged -ParameterFilter { $Force } -Times 1 -Exactly
     }
+
+    It "shows DONE immediately for straight completion without polling" {
+        $fixedNow = [DateTime]::new(2024, 6, 1, 12, 0, 0)
+        $pastEnd = $fixedNow.AddSeconds(-1).ToString('o')
+
+        $runningTimer = [PSCustomObject]@{
+            Id              = "1"
+            Duration        = "5s"
+            Seconds         = 5
+            Message         = "Time is up!"
+            StartTime       = $fixedNow.AddSeconds(-6).ToString('o')
+            EndTime         = $pastEnd
+            RepeatTotal     = 1
+            RepeatRemaining = 0
+            CurrentRun      = 1
+            State           = "Running"
+            IsSequence      = $false
+        }
+
+        Mock Get-Date { return $fixedNow }
+        Mock Wait-OneSecondOrKeyPress { return $true }
+        Mock Clear-Host { }
+        Mock Get-TimerWatchCompletedContent { return [System.Text.StringBuilder]::new() }
+        Mock Start-Sleep { }
+
+        Mock Get-TimerDataIfChanged {
+            return @{ Data = @($runningTimer); Changed = $true }
+        }
+
+        $inputTimer = [PSCustomObject]@{
+            Id         = "1"
+            Seconds    = 5
+            Message    = "Time is up!"
+            EndTime    = $pastEnd
+            IsSequence = $false
+        }
+
+        Show-TimerWatchDisplay -Timer $inputTimer
+
+        Assert-MockCalled -CommandName Get-TimerWatchCompletedContent -Times 1 -Exactly
+        Assert-MockCalled -CommandName Get-TimerDataIfChanged -ParameterFilter { $Force } -Times 0 -Exactly
+        Assert-MockCalled -CommandName Start-Sleep -Times 0 -Exactly
+    }
+
+    It "exits poll early when refreshed timer is Completed" {
+        $fixedNow = [DateTime]::new(2024, 6, 1, 12, 0, 0)
+        $pastEnd = $fixedNow.AddSeconds(-1).ToString('o')
+
+        $timerLastRun = [PSCustomObject]@{
+            Id              = "1"
+            Duration        = "5s"
+            Seconds         = 5
+            Message         = "Time is up!"
+            StartTime       = $fixedNow.AddSeconds(-6).ToString('o')
+            EndTime         = $pastEnd
+            RepeatTotal     = 2
+            RepeatRemaining = 1
+            CurrentRun      = 1
+            State           = "Running"
+            IsSequence      = $false
+        }
+        $timerCompleted = [PSCustomObject]@{
+            Id              = "1"
+            Duration        = "5s"
+            Seconds         = 5
+            Message         = "Time is up!"
+            StartTime       = $timerLastRun.StartTime
+            EndTime         = $pastEnd
+            RepeatTotal     = 2
+            RepeatRemaining = 0
+            CurrentRun      = 2
+            State           = "Completed"
+            IsSequence      = $false
+        }
+
+        Mock Get-Date { return $fixedNow }
+        Mock Wait-OneSecondOrKeyPress { return $true }
+        Mock Clear-Host { }
+        Mock Get-TimerWatchCompletedContent { return [System.Text.StringBuilder]::new() }
+        Mock Start-Sleep { }
+
+        Mock Get-TimerDataIfChanged {
+            param([switch]$Force)
+            if ($Force) {
+                return @{ Data = @($timerCompleted); Changed = $true }
+            }
+            return @{ Data = @($timerLastRun); Changed = $true }
+        }
+
+        $inputTimer = [PSCustomObject]@{
+            Id         = "1"
+            Seconds    = 5
+            Message    = "Time is up!"
+            EndTime    = $pastEnd
+            IsSequence = $false
+        }
+
+        Show-TimerWatchDisplay -Timer $inputTimer
+
+        Assert-MockCalled -CommandName Get-TimerWatchCompletedContent -Times 1 -Exactly
+        Assert-MockCalled -CommandName Get-TimerDataIfChanged -ParameterFilter { $Force } -Times 1 -Exactly
+    }
 }
 
 Describe "Timer scheduled task helpers" {

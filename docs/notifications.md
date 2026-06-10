@@ -5,7 +5,7 @@ When a timer phase completes, PS1Timer can notify you through three **independen
 | Channel | Config key | Values | Behavior |
 |---------|------------|--------|----------|
 | Visual | `Visual` | `popup` \| `toast` \| `none` | Modal dialog, tray balloon, or no UI |
-| Sound | `Sound` | `$true` \| `$false` | Console beep or `SoundFile` when on |
+| Sound | `Sound` | `$true` \| `$false` | Console beep or named/raw `SoundFile` when on |
 | Webhook | `Webhook` | named key or `$null` | POST JSON when defined (additive) |
 
 Example combinations:
@@ -22,12 +22,17 @@ $global:Config = @{
         Visual    = 'none'
         Sound     = $true
         Webhook   = 'discord-main'   # optional; fires when set
-        SoundFile = $null            # e.g. 'C:\sounds\alarm.wav'
+        SoundFile = 'notify'         # name from Sounds ($null = console beep)
         AfterStart = 'none'
     }
     Webhooks = @{
         'discord-main' = 'https://discord.com/api/webhooks/...'
         'ntfy-phone'   = 'https://ntfy.sh/my-topic'
+    }
+    Sounds = @{
+        notify = "$env:windir\Media\notify.wav"
+        ding   = "$env:windir\Media\ding.wav"
+        # ... see config.example.ps1 for full list
     }
 }
 ```
@@ -66,7 +71,38 @@ Presets may set `Visual`, `Sound`, and `Webhook` per preset (e.g. `tabata` with 
 ## Sound
 
 - Without `SoundFile`: uses `[console]::beep`
-- With `SoundFile`: plays the `.wav` via `System.Media.SoundPlayer`
+- With `SoundFile`: plays a `.wav` via `System.Media.SoundPlayer`
+- Set `SoundFile` to a **name** from `Config.Sounds`, a raw `.wav` path, or `$null` for beep
+
+### Named presets (`Config.Sounds`)
+
+Shipped in `config.example.ps1` — pick one for `TimerDefaults.SoundFile`:
+
+| Name | File | Good for |
+|------|------|----------|
+| `notify` | `notify.wav` | Soft default ping |
+| `ding` | `ding.wav` | Short crisp ping |
+| `chimes` | `chimes.wav` | Gentle chime |
+| `chord` | `chord.wav` | Musical chord |
+| `win-notify` | `Windows Notify.wav` | Classic Windows notify |
+| `win-ding` | `Windows Ding.wav` | Windows ding |
+| `tada` | `tada.wav` | Done / celebration (longer) |
+| `alarm-soft` | `Alarm01.wav` | Noticeable alarm |
+| `alarm-loud` | `Alarm06.wav` | Strong alarm |
+| `ring` | `Ring01.wav` | Phone-ring style |
+| `win-calendar` | `Windows Notify Calendar.wav` | Calendar-style notify |
+| `win-email` | `Windows Notify Email.wav` | Email-style notify |
+| `win-exclamation` | `Windows Exclamation.wav` | Attention grab |
+| `win-critical` | `Windows Critical Stop.wav` | Urgent / can't miss |
+
+Preview:
+
+```powershell
+$path = Resolve-TimerSoundFilePath -Name 'notify'
+(New-Object System.Media.SoundPlayer $path).PlaySync()
+```
+
+Add custom entries under `Sounds` pointing to any `.wav` path.
 
 ## Legacy `Notify` mapping
 
