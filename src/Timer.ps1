@@ -149,6 +149,12 @@ function Save-TimerData {
             }
 
             # Add sequence-specific fields if present
+            if ($t.PSObject.Properties.Name -contains 'NotifyVisual' -and $t.NotifyVisual) {
+                $obj | Add-Member -NotePropertyName 'NotifyVisual' -NotePropertyValue $t.NotifyVisual
+            }
+            if ($t.PSObject.Properties.Name -contains 'NotifySound') {
+                $obj | Add-Member -NotePropertyName 'NotifySound' -NotePropertyValue ([bool]$t.NotifySound)
+            }
             if ($t.PSObject.Properties.Name -contains 'NotifyType' -and $t.NotifyType) {
                 $obj | Add-Member -NotePropertyName 'NotifyType' -NotePropertyValue $t.NotifyType
             }
@@ -198,9 +204,10 @@ function Invoke-TimerFireScriptRecovery {
             Start-SequenceTimerJob -Timer $Timer
         }
         else {
+            $channels = Get-TimerNotifyChannelsFromTimer -Timer $Timer
             $webhookUrl = if ($Timer.WebhookName) { Resolve-TimerWebhookUrl -Name $Timer.WebhookName } else { $null }
-            $notify = if ($Timer.NotifyType) { $Timer.NotifyType } else { 'popup' }
-            Start-TimerJob -Timer $Timer -Notify $notify -WebhookUrl $webhookUrl
+            $soundFile = (Get-TimerNotificationConfig).SoundFile
+            Start-TimerJob -Timer $Timer -Visual $channels.Visual -Sound $channels.Sound -WebhookUrl $webhookUrl -SoundFile $soundFile
         }
         try {
             $null = [scriptblock]::Create((Get-Content -LiteralPath $scriptPath -Raw))
@@ -1139,98 +1146,271 @@ function Get-TimerNotificationConfig {
     .SYNOPSIS
         Gets the notification configuration from global config.
     .DESCRIPTION
-        Returns notification settings with defaults if not configured.
+        Returns composable Visual/Sound/Webhook settings with legacy Notify fallback.
     #>
-    $defaults = @{
-        Notify    = 'popup'
-        Webhook   = $null
-        SoundFile = $null
-    }
-
     $config = Get-PS1TimerModuleTimerDefaults
-    if ($config.Notify) { $defaults.Notify = $config.Notify }
-    if ($config.Webhook) { $defaults.Webhook = $config.Webhook }
-    if ($config.SoundFile) { $defaults.SoundFile = $config.SoundFile }
+    $channels = Get-TimerNotifyChannelsFromSource -Source $config
 
-    return $defaults
+    return @{
+        Visual    = $channels.Visual
+        Sound     = $channels.Sound
+        Webhook   = if ($config.Webhook) { $config.Webhook } else { $null }
+        SoundFile = if ($config.SoundFile) { $config.SoundFile } else { $null }
+        Notify    = if ($config.Notify) { $config.Notify } else { $null }
+    }
 }
 
 function Resolve-TimerNotificationSettings {
     <#
     .SYNOPSIS
-        Resolves notify type and named webhook for a new timer.
+        Resolves composable notify channels and optional webhook for a new timer.
     #>
     param(
         [string]$NotifyOverride = $null,
+        [string]$VisualOverride = $null,
+        $SoundOverride = $null,
         [string]$WebhookOverride = $null,
         [string]$PresetNotify = $null,
+        [string]$PresetVisual = $null,
+        $PresetSound = $null,
         [string]$PresetWebhook = $null
     )
 
-    $validTypes = @('popup', 'toast', 'sound', 'silent', 'webhook')
-    $notify = $null
-    $webhookName = $null
+    $validLegacy = @('popup', 'toast', 'sound', 'silent', 'webhook')
+    $validVisual = @('popup', 'toast', 'none')
+    $defaults = Get-TimerNotificationConfig
+    $visual = $defaults.Visual
+    $sound = $defaults.Sound
+    $webhookName = $defaults.Webhook
+    $legacyWebhookOnly = $false
 
-    if ($NotifyOverride -and ($validTypes -contains $NotifyOverride.ToLower())) {
-        $notify = $NotifyOverride.ToLower()
-    }
-    elseif ($PresetNotify -and ($validTypes -contains $PresetNotify.ToLower())) {
-        $notify = $PresetNotify.ToLower()
+    if ($NotifyOverride -and ($validLegacy -contains $NotifyOverride.ToLower())) {
+        $legacy = ConvertFrom-LegacyNotifyMode -Notify $NotifyOverride
+        $visual = $legacy.Visual
+        $sound = $legacy.Sound
+        $legacyWebhookOnly = ($NotifyOverride.ToLower() -eq 'webhook')
+        $webhookName = $null
+        if ($WebhookOverride) { $webhookName = $WebhookOverride }
+        elseif ($legacyWebhookOnly) { $webhookName = $defaults.Webhook }
     }
     else {
-        $config = Get-TimerNotificationConfig
-        if ($config.Notify -and ($validTypes -contains $config.Notify.ToLower())) {
-            $notify = $config.Notify.ToLower()
+        if ($PresetNotify -and ($validLegacy -contains $PresetNotify.ToLower())) {
+            $legacy = ConvertFrom-LegacyNotifyMode -Notify $PresetNotify
+            $visual = $legacy.Visual
+            $sound = $legacy.Sound
+            if ($PresetNotify.ToLower() -eq 'webhook') {
+                $legacyWebhookOnly = $true
+                $webhookName = if ($PresetWebhook) { $PresetWebhook } else { $defaults.Webhook }
+            }
         }
         else {
-            $notify = 'popup'
+            if ($PresetVisual -and ($validVisual -contains $PresetVisual.ToLower())) {
+                $visual = $PresetVisual.ToLower()
+            }
+            if ($null -ne $PresetSound) { $sound = [bool]$PresetSound }
+            if ($PresetWebhook) { $webhookName = $PresetWebhook }
         }
-    }
 
-    if ($WebhookOverride) {
-        $webhookName = $WebhookOverride
-    }
-    elseif ($PresetWebhook) {
-        $webhookName = $PresetWebhook
-    }
-    else {
-        $config = Get-TimerNotificationConfig
-        $webhookName = $config.Webhook
+        if ($VisualOverride -and ($validVisual -contains $VisualOverride.ToLower())) {
+            $visual = $VisualOverride.ToLower()
+        }
+        if ($null -ne $SoundOverride) { $sound = [bool]$SoundOverride }
+        if ($WebhookOverride) { $webhookName = $WebhookOverride }
     }
 
     $webhookUrl = $null
-    if ($notify -eq 'webhook') {
+    if (-not [string]::IsNullOrWhiteSpace($webhookName)) {
         $webhookUrl = Resolve-TimerWebhookUrl -Name $webhookName
         if (-not $webhookUrl) {
-            Write-Warning "PS1Timer: webhook notify requires a valid -Webhook name (configured in Config.Webhooks)."
-            $notify = 'popup'
+            Write-Warning "PS1Timer: Webhook '$webhookName' not found in Config.Webhooks."
+            if ($legacyWebhookOnly) {
+                $visual = 'popup'
+                $sound = $true
+            }
+            $webhookName = $null
         }
     }
 
+    $label = Format-TimerNotifyLabel -Visual $visual -Sound $sound -WebhookName $webhookName
+    $legacyNotify = if (-not $sound -and $visual -eq 'none' -and -not $webhookUrl) {
+        'silent'
+    }
+    elseif (-not $sound -and $visual -eq 'none' -and $webhookUrl) {
+        'webhook'
+    }
+    elseif ($sound -and $visual -eq 'none' -and -not $webhookUrl) {
+        'sound'
+    }
+    else {
+        $visual
+    }
+
     return @{
-        NotifyType  = $notify
+        Visual      = $visual
+        Sound       = $sound
         WebhookName = $webhookName
         WebhookUrl  = $webhookUrl
+        SoundFile   = $defaults.SoundFile
+        Label       = $label
+        NotifyType  = $legacyNotify
     }
+}
+
+function Get-TimerFireScriptSoundBlock {
+    <#
+    .SYNOPSIS
+        PowerShell block for sound in timer fire scripts.
+    #>
+    param(
+        [bool]$Sound = $true,
+        [string]$SoundFile = $null,
+        [ValidateSet('simple', 'sequence')]
+        [string]$Mode = 'simple'
+    )
+
+    if (-not $Sound) { return '' }
+
+    if ($SoundFile) {
+        $escapedSound = $SoundFile -replace "'", "''"
+        return @"
+if (`$notifySound) {
+    try {
+        if (Test-Path -LiteralPath '$escapedSound') {
+            `$player = New-Object System.Media.SoundPlayer '$escapedSound'
+            `$player.PlaySync()
+        } else {
+            [console]::beep(440, 500)
+        }
+    } catch {
+        try { [console]::beep(440, 500) } catch { }
+    }
+}
+"@
+    }
+
+    if ($Mode -eq 'sequence') {
+        return @"
+if (`$notifySound) {
+    try {
+        if (`$currentPhase -eq `$totalPhases - 1) {
+            [console]::beep(523, 200); [console]::beep(659, 200); [console]::beep(784, 400)
+        } else {
+            [console]::beep(440, 300)
+        }
+    } catch { }
+}
+"@
+    }
+
+    return @"
+if (`$notifySound) {
+    try { [console]::beep(440, 500) } catch { }
+}
+"@
+}
+
+function Get-TimerFireScriptVisualBlock {
+    <#
+    .SYNOPSIS
+        PowerShell switch block for visual notifications in fire scripts.
+    #>
+    param(
+        [ValidateSet('popup', 'toast', 'none')]
+        [string]$Visual = 'popup',
+        [ValidateSet('simple', 'sequence')]
+        [string]$Mode = 'simple'
+    )
+
+    if ($Visual -eq 'none') { return '' }
+
+    if ($Mode -eq 'sequence') {
+        return @"
+switch (`$notifyVisual) {
+    'toast' {
+        try {
+            Add-Type -AssemblyName System.Windows.Forms | Out-Null
+            `$balloonText = if (`$currentPhase -eq `$totalPhases - 1) { "All `$totalPhases phases finished at `$endStr" } else { "Phase `$phaseNum done, starting `$nextPhaseNum at `$endStr" }
+            `$form = New-Object System.Windows.Forms.Form
+            `$form.WindowState = [System.Windows.Forms.FormWindowState]::Minimized
+            `$form.ShowInTaskbar = `$false
+            `$form.Visible = `$false
+            `$notifyIcon = New-Object System.Windows.Forms.NotifyIcon
+            `$notifyIcon.Icon = [System.Drawing.SystemIcons]::Information
+            `$notifyIcon.BalloonTipTitle = `$title
+            `$notifyIcon.BalloonTipText = `$balloonText
+            `$notifyIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
+            `$notifyIcon.Visible = `$true
+            `$notifyIcon.ShowBalloonTip(10000)
+            Start-Sleep -Milliseconds 11000
+            `$notifyIcon.Visible = `$false
+            `$notifyIcon.Dispose()
+            `$form.Dispose()
+        } catch {
+            `$popup = New-Object -ComObject WScript.Shell
+            `$popup.Popup((`$body -join [char]10), 0, `$title, 64) | Out-Null
+        }
+    }
+    'popup' {
+        `$popup = New-Object -ComObject WScript.Shell
+        `$popup.Popup((`$body -join [char]10), 0, `$title, 64) | Out-Null
+    }
+    'none' { }
+}
+"@
+    }
+
+    return @"
+switch (`$notifyVisual) {
+    'toast' {
+        try {
+            Add-Type -AssemblyName System.Windows.Forms | Out-Null
+            `$balloonText = "Timer #`$timerId finished at `$endStr"
+            `$form = New-Object System.Windows.Forms.Form
+            `$form.WindowState = [System.Windows.Forms.FormWindowState]::Minimized
+            `$form.ShowInTaskbar = `$false
+            `$form.Visible = `$false
+            `$notifyIcon = New-Object System.Windows.Forms.NotifyIcon
+            `$notifyIcon.Icon = [System.Drawing.SystemIcons]::Information
+            `$notifyIcon.BalloonTipTitle = `$message
+            `$notifyIcon.BalloonTipText = `$balloonText
+            `$notifyIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
+            `$notifyIcon.Visible = `$true
+            `$notifyIcon.ShowBalloonTip(10000)
+            Start-Sleep -Milliseconds 11000
+            `$notifyIcon.Visible = `$false
+            `$notifyIcon.Dispose()
+            `$form.Dispose()
+        } catch {
+            `$popup = New-Object -ComObject WScript.Shell
+            `$popup.Popup((`$body -join [char]10), 0, `$message, 64) | Out-Null
+        }
+    }
+    'popup' {
+        `$popup = New-Object -ComObject WScript.Shell
+        `$popup.Popup((`$body -join [char]10), 0, `$message, 64) | Out-Null
+    }
+    'none' { }
+}
+"@
 }
 
 function Get-TimerFireScriptWebhookBlock {
     <#
     .SYNOPSIS
-        PowerShell switch branch for webhook notifications in fire scripts.
+        PowerShell if-block for webhook notifications in fire scripts.
     #>
     param([string]$WebhookUrl)
-    if ([string]::IsNullOrWhiteSpace($WebhookUrl)) { return "    'webhook' { }" }
+    if ([string]::IsNullOrWhiteSpace($WebhookUrl)) { return '' }
     $escapedUrl = $WebhookUrl -replace "'", "''"
     return @"
-    'webhook' {
-        try {
-            `$payload = @{ content = (`$body -join ' | ') } | ConvertTo-Json -Compress
-            Invoke-RestMethod -Uri '$escapedUrl' -Method Post -Body `$payload -ContentType 'application/json' -TimeoutSec 15 | Out-Null
-        } catch {
-            "`$(Get-Date -Format 'o') ERROR webhook: `$(`$_.Exception.Message)" | Add-Content -LiteralPath `$logFile -Force
-        }
+if (`$webhookUrl) {
+    try {
+        `$payload = @{ content = (`$body -join ' | ') } | ConvertTo-Json -Compress
+        Invoke-RestMethod -Uri '$escapedUrl' -Method Post -Body `$payload -ContentType 'application/json' -TimeoutSec 15 | Out-Null
+    } catch {
+        "`$(Get-Date -Format 'o') ERROR webhook: `$(`$_.Exception.Message)" | Add-Content -LiteralPath `$logFile -Force
     }
+}
 "@
 }
 
@@ -1308,55 +1488,43 @@ function Invoke-TimerAfterStart {
 function Show-TimerNotification {
     <#
     .SYNOPSIS
-        Shows a timer notification using the configured method.
+        Shows a timer notification using composable visual and sound channels.
+    .PARAMETER Visual
+        Visual channel: popup, toast, none
+    .PARAMETER Sound
+        Whether to play sound
     .PARAMETER Type
-        Notification type: popup, toast, sound, silent
-    .PARAMETER Title
-        Notification title
-    .PARAMETER Message
-        Main message
-    .PARAMETER Body
-        Additional body lines (array)
-    .PARAMETER SoundFile
-        Optional custom sound file path
+        Legacy notification type (maps to Visual/Sound when Visual not set)
     #>
     param(
-        [Parameter(Mandatory=$true)]
+        [ValidateSet('popup', 'toast', 'none')]
+        [string]$Visual = $null,
+        [bool]$Sound = $true,
         [ValidateSet('popup', 'toast', 'sound', 'silent', 'webhook')]
-        [string]$Type,
-        
+        [string]$Type = $null,
         [Parameter(Mandatory=$true)]
         [string]$Title,
-        
         [string]$Message = '',
-        
         [array]$Body = @(),
-        
         [string]$SoundFile = $null
     )
-    
-    # Always play sound first (unless silent)
-    if ($Type -ne 'silent') {
-        Play-TimerSound -Type $Type -SoundFile $SoundFile
+
+    if ($Type -and -not $Visual) {
+        $legacy = ConvertFrom-LegacyNotifyMode -Notify $Type
+        $Visual = $legacy.Visual
+        $Sound = $legacy.Sound
     }
-    
-    # Then show visual notification (unless sound-only mode)
-    switch ($Type) {
-        'popup' {
-            Show-TimerPopup -Title $Title -Body $Body
-        }
-        'toast' {
-            Show-TimerToast -Title $Title -Message $Message -Body $Body
-        }
-        'sound' {
-            # Sound only, no visual notification
-        }
-        'silent' {
-            # Nothing at all
-        }
-        'webhook' {
-            # Webhook is handled in scheduled-task fire scripts
-        }
+    if (-not $Visual) { $Visual = 'popup' }
+
+    if ($Sound) {
+        $soundType = if ($Visual -eq 'none') { 'sound' } else { $Visual }
+        Play-TimerSound -Type $soundType -SoundFile $SoundFile
+    }
+
+    switch ($Visual) {
+        'popup' { Show-TimerPopup -Title $Title -Body $Body }
+        'toast' { Show-TimerToast -Title $Title -Message $Message -Body $Body }
+        'none'  { }
     }
 }
 
@@ -1494,11 +1662,7 @@ function Play-TimerSound {
 function Get-TimerNotificationType {
     <#
     .SYNOPSIS
-        Resolves the notification type from various sources.
-    .DESCRIPTION
-        Priority: Per-timer override > Config default > 'popup'
-    .PARAMETER Override
-        Per-timer override value
+        Resolves legacy notification type from various sources (deprecated).
     #>
     param([string]$Override = $null)
 
@@ -1515,35 +1679,27 @@ function Show-TimerNotificationHelp {
     Write-Host "  NOTIFICATION OPTIONS" -ForegroundColor Cyan
     Write-Host "  ===================" -ForegroundColor DarkCyan
     Write-Host ""
-    Write-Host "  You can customize how timer notifications appear:" -ForegroundColor White
+    Write-Host "  Three independent channels (config.ps1 TimerDefaults):" -ForegroundColor White
+    Write-Host "    Visual  popup | toast | none" -ForegroundColor Green
+    Write-Host "    Sound   `$true | `$false" -ForegroundColor Green
+    Write-Host "    Webhook named key from Webhooks (fires when set)" -ForegroundColor Green
     Write-Host ""
-    Write-Host "  Per-timer flag:" -ForegroundColor Yellow
-    Write-Host "    t 25m " -ForegroundColor Gray -NoNewline
-    Write-Host "-Notify toast" -ForegroundColor Green -NoNewline
-    Write-Host "     # Use toast for this timer" -ForegroundColor DarkGray
-    Write-Host "    t 30m -Notify sound          # Sound only" -ForegroundColor DarkGray
-    Write-Host "    t 25m -Notify silent         # No notification" -ForegroundColor DarkGray
-    Write-Host "    t 25m -Notify webhook -Webhook discord-main" -ForegroundColor DarkGray
+    Write-Host "  Per-timer flags:" -ForegroundColor Yellow
+    Write-Host "    t 25m -Visual toast -Sound" -ForegroundColor Gray
+    Write-Host "    t 25m -Visual none -Sound              # sound only" -ForegroundColor Gray
+    Write-Host "    t 25m -Webhook discord-main            # adds webhook" -ForegroundColor Gray
+    Write-Host "    t 25m -Notify toast                    # legacy shorthand" -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host "  Notification Types:" -ForegroundColor Yellow
-    Write-Host "    popup    " -ForegroundColor Green -NoNewline
-    Write-Host "Modal dialog (default, blocks until OK)" -ForegroundColor White
-    Write-Host "    toast    " -ForegroundColor Green -NoNewline
-    Write-Host "Windows balloon tip (non-blocking, system tray)" -ForegroundColor White
-    Write-Host "    sound    " -ForegroundColor Green -NoNewline
-    Write-Host "Play sound only, no popup" -ForegroundColor White
-    Write-Host "    silent   " -ForegroundColor Green -NoNewline
-    Write-Host "No notification at all" -ForegroundColor White
-    Write-Host "    webhook  " -ForegroundColor Green -NoNewline
-    Write-Host "POST to named URL from Config.Webhooks" -ForegroundColor White
+    Write-Host "  Legacy -Notify shorthand:" -ForegroundColor Yellow
+    Write-Host "    popup | toast | sound | silent | webhook" -ForegroundColor Green
     Write-Host ""
     Write-Host "  Default Configuration (config.ps1):" -ForegroundColor Yellow
     Write-Host "    TimerDefaults = @{" -ForegroundColor Gray
-    Write-Host "        Notify = 'toast'" -ForegroundColor Gray
-    Write-Host "        Webhook = 'discord-main'  # When Notify = webhook" -ForegroundColor Gray
-    Write-Host "        SoundFile = 'C:\\path\\to\\sound.wav'  # Optional" -ForegroundColor Gray
+    Write-Host "        Visual  = 'toast'" -ForegroundColor Gray
+    Write-Host "        Sound   = `$true" -ForegroundColor Gray
+    Write-Host "        Webhook = 'discord-main'" -ForegroundColor Gray
+    Write-Host "        SoundFile = 'C:\\path\\to\\sound.wav'" -ForegroundColor Gray
     Write-Host "    }" -ForegroundColor Gray
-    Write-Host "    Webhooks = @{ 'discord-main' = 'https://...' }" -ForegroundColor Gray
     Write-Host ""
 }
 # endregion Timer-Notifications.ps1
@@ -1699,9 +1855,17 @@ function Start-TimerJob {
     #>
     param(
         [PSCustomObject]$Timer,
-        [string]$Notify = 'popup',
-        [string]$WebhookUrl = $null
+        [ValidateSet('popup', 'toast', 'none')]
+        [string]$Visual = $null,
+        $Sound = $null,
+        [string]$WebhookUrl = $null,
+        [string]$SoundFile = $null
     )
+
+    $channels = Get-TimerNotifyChannelsFromTimer -Timer $Timer
+    if (-not $Visual) { $Visual = $channels.Visual }
+    if ($null -eq $Sound) { $Sound = $channels.Sound }
+    if (-not $SoundFile) { $SoundFile = (Get-TimerNotificationConfig).SoundFile }
 
     $taskName = if ($Timer.PSObject.Properties.Name -contains 'TaskName' -and -not [string]::IsNullOrWhiteSpace($Timer.TaskName)) {
         $Timer.TaskName
@@ -1710,7 +1874,7 @@ function Start-TimerJob {
     }
     $dataFile = Join-Path $env:TEMP "ps-timers.json"
 
-    if ($Notify -eq 'webhook' -and -not $WebhookUrl -and $Timer.WebhookName) {
+    if (-not $WebhookUrl -and $Timer.WebhookName) {
         $WebhookUrl = Resolve-TimerWebhookUrl -Name $Timer.WebhookName
     }
 
@@ -1720,8 +1884,12 @@ function Start-TimerJob {
         (Get-Date).AddSeconds($Timer.Seconds)
     }
 
+    $soundBlock = Get-TimerFireScriptSoundBlock -Sound $Sound -SoundFile $SoundFile -Mode 'simple'
+    $visualBlock = Get-TimerFireScriptVisualBlock -Visual $Visual -Mode 'simple'
     $webhookBlock = Get-TimerFireScriptWebhookBlock -WebhookUrl $WebhookUrl
     $historyBlock = Get-TimerFireScriptHistoryBlock -TimerIdExpr '$timerId' -LabelExpr '$message' -SecondsExpr '$timerSeconds' -IsSequenceExpr '$false'
+    $notifySoundLiteral = if ($Sound) { '$true' } else { '$false' }
+    $webhookLiteral = if ($WebhookUrl) { "'$($WebhookUrl -replace "'", "''")'" } else { '$null' }
 
     # Build the notification script that runs when timer fires
     $script = @"
@@ -1733,13 +1901,13 @@ function Start-TimerJob {
 `$timerSeconds = $($Timer.Seconds)
 `$dataFile = '$dataFile'
 `$logFile = "`$env:TEMP\PSTimer_`$timerId.log"
-`$notifyType = '$Notify'
+`$notifyVisual = '$Visual'
+`$notifySound = $notifySoundLiteral
+`$webhookUrl = $webhookLiteral
 `$currentTaskName = '$taskName'
 
 try {
-    if (`$notifyType -notin @('silent', 'webhook')) {
-        try { [console]::beep(440, 500) } catch { }
-    }
+$soundBlock
 
     # Update timer data FIRST (before popup, so tl shows correct state)
     if (Test-Path -LiteralPath `$dataFile) {
@@ -1850,47 +2018,8 @@ try {
 `$body = @("Timer #`$timerId completed!", "", "Duration: `$duration", "Finished: `$endStr")
 if (`$repeatTotal -gt 1) { `$body += "Run:      `$currentRun of `$repeatTotal" }
 
-# Use notification type
-switch (`$notifyType) {
-    'toast' {
-        try {
-            # Use Windows Forms balloon tip - works reliably in scheduled tasks
-            Add-Type -AssemblyName System.Windows.Forms | Out-Null
-            `$balloonText = "Timer #`$timerId finished at `$endStr"
-            `$form = New-Object System.Windows.Forms.Form
-            `$form.WindowState = [System.Windows.Forms.FormWindowState]::Minimized
-            `$form.ShowInTaskbar = `$false
-            `$form.Visible = `$false
-            `$notifyIcon = New-Object System.Windows.Forms.NotifyIcon
-            `$notifyIcon.Icon = [System.Drawing.SystemIcons]::Information
-            `$notifyIcon.BalloonTipTitle = `$message
-            `$notifyIcon.BalloonTipText = `$balloonText
-            `$notifyIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
-            `$notifyIcon.Visible = `$true
-            `$notifyIcon.ShowBalloonTip(10000)
-            Start-Sleep -Milliseconds 11000
-            `$notifyIcon.Visible = `$false
-            `$notifyIcon.Dispose()
-            `$form.Dispose()
-        } catch {
-            # Fallback to popup
-            `$popup = New-Object -ComObject WScript.Shell
-            `$popup.Popup((`$body -join [char]10), 0, `$message, 64) | Out-Null
-        }
-    }
-    'sound' {
-        # Sound only, already played above
-    }
-    'silent' {
-        # No notification at all
-    }
+$visualBlock
 $webhookBlock
-    default {
-        # Popup (default/original behavior)
-        `$popup = New-Object -ComObject WScript.Shell
-        `$popup.Popup((`$body -join [char]10), 0, `$message, 64) | Out-Null
-    }
-}
 $historyBlock
 "@
 
@@ -2248,10 +2377,7 @@ function Invoke-ResumeTimersBulk {
         $t.State = 'Running'
         $t | Add-Member -NotePropertyName 'RemainingSeconds' -NotePropertyValue $null -Force
         $t | Add-Member -NotePropertyName 'TaskName' -NotePropertyValue (New-TimerTaskName -TimerId $t.Id) -Force
-        Start-TimerJob -Timer ([PSCustomObject]@{
-            Id = $t.Id; Seconds = $seconds; Message = $t.Message; Duration = Format-Duration -Seconds $t.Seconds
-            StartTime = $t.StartTime; RepeatTotal = $t.RepeatTotal; CurrentRun = $t.CurrentRun; TaskName = $t.TaskName
-        })
+        Start-TimerJob -Timer $t
         $count++
     }
     Save-TimerData -Timers $Timers
@@ -2277,10 +2403,7 @@ function Invoke-ResumeSingleTimer {
     $timer.State = 'Running'
     $timer | Add-Member -NotePropertyName 'RemainingSeconds' -NotePropertyValue $null -Force
     $timer | Add-Member -NotePropertyName 'TaskName' -NotePropertyValue (New-TimerTaskName -TimerId $timer.Id) -Force
-    Start-TimerJob -Timer ([PSCustomObject]@{
-        Id = $timer.Id; Seconds = $seconds; Message = $timer.Message; Duration = Format-Duration -Seconds $timer.Seconds
-        StartTime = $timer.StartTime; RepeatTotal = $timer.RepeatTotal; CurrentRun = $timer.CurrentRun; TaskName = $timer.TaskName
-    })
+    Start-TimerJob -Timer $timer
     Save-TimerData -Timers $Timers
     return @{ Found = $true; CanResume = $true; IsLost = $isLost; NewEndTime = $newEndTime }
 }
@@ -2636,7 +2759,9 @@ function New-SequenceTimerFromPhases {
         [array]$Phases,
         [object]$Summary,
         [DateTime]$Now,
-        [string]$NotifyType = 'popup',
+        [string]$NotifyVisual = 'popup',
+        $NotifySound = $true,
+        [string]$NotifyType = $null,
         [string]$WebhookName = $null
     )
     $firstPhase = $Phases[0]
@@ -2672,6 +2797,8 @@ function New-SequenceTimerFromPhases {
         TotalPhases     = $phaseCount
         PhaseLabel      = $firstPhase.Label
         TotalSeconds    = $totalSecs
+        NotifyVisual    = $NotifyVisual
+        NotifySound     = $NotifySound
         NotifyType      = $NotifyType
         WebhookName     = $WebhookName
         TaskName        = New-TimerTaskName -TimerId $Id
@@ -2719,10 +2846,8 @@ function Write-SequenceTimerConfirmation {
     Write-Host "  Ends at:  " -ForegroundColor Gray -NoNewline
     Write-Host $EndTime.ToString('HH:mm:ss') -ForegroundColor Yellow
     if ($NotifyLabel) {
-        $label = $NotifyLabel
-        if ($NotifyLabel -eq 'webhook' -and $WebhookName) { $label += " ($WebhookName)" }
         Write-Host "  Notify:   " -ForegroundColor Gray -NoNewline
-        Write-Host $label -ForegroundColor Green
+        Write-Host $NotifyLabel -ForegroundColor Green
     }
     Write-Host ""
 }
@@ -2740,11 +2865,9 @@ function Start-SequenceTimerJob {
         New-TimerTaskName -TimerId $Timer.Id
     }
     $dataFile = Join-Path $env:TEMP "ps-timers.json"
-    $notifyType = if ($Timer.NotifyType) { $Timer.NotifyType } else { 'popup' }
-    $webhookUrl = $null
-    if ($notifyType -eq 'webhook' -and $Timer.WebhookName) {
-        $webhookUrl = Resolve-TimerWebhookUrl -Name $Timer.WebhookName
-    }
+    $channels = Get-TimerNotifyChannelsFromTimer -Timer $Timer
+    $webhookUrl = if ($Timer.WebhookName) { Resolve-TimerWebhookUrl -Name $Timer.WebhookName } else { $null }
+    $soundFile = (Get-TimerNotificationConfig).SoundFile
 
     $triggerTime = if ($Timer.State -eq 'Scheduled') {
         [DateTime]::Parse($Timer.EndTime)
@@ -2752,14 +2875,20 @@ function Start-SequenceTimerJob {
         (Get-Date).AddSeconds($Timer.Seconds)
     }
 
+    $soundBlock = Get-TimerFireScriptSoundBlock -Sound $channels.Sound -SoundFile $soundFile -Mode 'sequence'
+    $visualBlock = Get-TimerFireScriptVisualBlock -Visual $channels.Visual -Mode 'sequence'
     $webhookBlock = Get-TimerFireScriptWebhookBlock -WebhookUrl $webhookUrl
     $historyBlock = Get-TimerFireScriptHistoryBlock -TimerIdExpr '$timerId' -LabelExpr '$phaseLabel' -SecondsExpr '$timer.Seconds' -IsSequenceExpr '$true'
+    $notifySoundLiteral = if ($channels.Sound) { '$true' } else { '$false' }
+    $webhookLiteral = if ($webhookUrl) { "'$($webhookUrl -replace "'", "''")'" } else { '$null' }
 
     # Build the notification script using here-string
     $script = @"
 `$timerId = '$($Timer.Id)'
 `$dataFile = '$dataFile'
-`$notifyType = '$notifyType'
+`$notifyVisual = '$($channels.Visual)'
+`$notifySound = $notifySoundLiteral
+`$webhookUrl = $webhookLiteral
 `$logFile = "`$env:TEMP\PSTimer_`$timerId.log"
 `$utf8Bom = New-Object System.Text.UTF8Encoding `$true
 
@@ -2789,15 +2918,7 @@ if (-not `$timer.IsSequence) { exit }
 `$totalPhases = [int]`$timer.TotalPhases
 `$phaseLabel = `$timer.PhaseLabel
 
-if (`$notifyType -notin @('silent', 'webhook')) {
-    try {
-        if (`$currentPhase -eq `$totalPhases - 1) {
-            [console]::beep(523, 200); [console]::beep(659, 200); [console]::beep(784, 400)
-        } else {
-            [console]::beep(440, 300)
-        }
-    } catch { }
-}
+$soundBlock
 
 `$nextPhaseIdx = `$currentPhase + 1
 
@@ -2882,40 +3003,8 @@ if (`$currentPhase -eq `$totalPhases - 1) {
     `$title = "Phase Complete"
 }
 
-# Use notification type
-switch (`$notifyType) {
-    'toast' {
-        try {
-            Add-Type -AssemblyName System.Windows.Forms | Out-Null
-            `$balloonText = if (`$currentPhase -eq `$totalPhases - 1) { "All `$totalPhases phases finished at `$endStr" } else { "Phase `$phaseNum done, starting `$nextPhaseNum at `$endStr" }
-            `$form = New-Object System.Windows.Forms.Form
-            `$form.WindowState = [System.Windows.Forms.FormWindowState]::Minimized
-            `$form.ShowInTaskbar = `$false
-            `$form.Visible = `$false
-            `$notifyIcon = New-Object System.Windows.Forms.NotifyIcon
-            `$notifyIcon.Icon = [System.Drawing.SystemIcons]::Information
-            `$notifyIcon.BalloonTipTitle = `$title
-            `$notifyIcon.BalloonTipText = `$balloonText
-            `$notifyIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
-            `$notifyIcon.Visible = `$true
-            `$notifyIcon.ShowBalloonTip(10000)
-            Start-Sleep -Milliseconds 11000
-            `$notifyIcon.Visible = `$false
-            `$notifyIcon.Dispose()
-            `$form.Dispose()
-        } catch {
-            `$popup = New-Object -ComObject WScript.Shell
-            `$popup.Popup((`$body -join [char]10), 0, `$title, 64) | Out-Null
-        }
-    }
-    'sound' { }
-    'silent' { }
+$visualBlock
 $webhookBlock
-    default {
-        `$popup = New-Object -ComObject WScript.Shell
-        `$popup.Popup((`$body -join [char]10), 0, `$title, 64) | Out-Null
-    }
-}
 $historyBlock
 "@
 
@@ -2936,7 +3025,7 @@ function Show-TimerHelp {
         Shows timer commands help dashboard.
     #>
     Write-HelpMenu -Title "TIMER COMMANDS" -Commands @(
-        @{ Name='Timer <time>'; Alias='T'; Params='[msg] [repeat] [-Notify] [-Webhook] [-At]'; Desc='Start a timer (simple or sequence pattern)' }
+        @{ Name='Timer <time>'; Alias='T'; Params='[msg] [repeat] [-Visual] [-Sound] [-Webhook] [-At]'; Desc='Start a timer (simple or sequence pattern)' }
         @{ Name='Timer-Stats'; Alias='TS'; Params=''; Desc='Show timer completion history (today/week)' }
         @{ Name='Timer-Presets'; Alias='TPRE'; Params=''; Desc='Pick from preset sequences (Pomodoro, etc.)' }
         @{ Name='Timer-List'; Alias='TL'; Params='[-a] [-w]'; Desc='List active timers (-a all, -w live watch)' }
@@ -2973,16 +3062,12 @@ function Show-TimerHelp {
             Title = 'NOTIFICATION OPTIONS'
             Underline = '===================='
             Lines = @(
-                @{ Type='text'; Label='  Per-timer: '; Value='t 25m -Notify webhook -Webhook discord-main'; LabelColor='Yellow'; ValueColor='Gray' }
+                @{ Type='text'; Label='  Per-timer: '; Value='t 25m -Visual toast -Sound -Webhook discord-main'; LabelColor='Yellow'; ValueColor='Gray' }
                 @{ Type='raw'; Text='' }
-                @{ Type='raw'; Text='  Types: popup | toast | sound | silent | webhook'; Color='Green' }
+                @{ Type='raw'; Text='  Channels: Visual popup|toast|none  Sound on|off  Webhook if set'; Color='Green' }
+                @{ Type='raw'; Text='  Legacy: -Notify popup|toast|sound|silent|webhook' }
                 @{ Type='raw'; Text='' }
-                @{ Type='raw'; Text='  popup  Modal dialog (default, blocks until OK)' }
-                @{ Type='raw'; Text='  toast  Windows toast notification (non-blocking)' }
-                @{ Type='raw'; Text='  sound  Sound only, no visual notification' }
-                @{ Type='raw'; Text='  silent No notification at all' }
-                @{ Type='raw'; Text='' }
-                @{ Type='raw'; Text='  Default: config.example.ps1 or config.ps1 -> TimerDefaults.Notify' }
+                @{ Type='raw'; Text='  Default: config.ps1 -> TimerDefaults.Visual, .Sound, .Webhook' }
                 @{ Type='raw'; Text='' }
                 @{ Type='raw'; Text='  After start: TimerDefaults.AfterStart = none | watch | list' }
                 @{ Type='raw'; Text='    none  confirmation only  |  watch  tw <id>  |  list  tl -w' }
@@ -3003,10 +3088,13 @@ function Timer {
     .PARAMETER Repeat
         Number of times to repeat the timer (e.g., -r 3 repeats 3 times total).
     .PARAMETER Notify
-        Notification type: popup (default), toast, sound, silent, webhook.
-        Override default in config.ps1 / config.example.ps1 TimerDefaults.Notify.
+        Legacy shorthand: popup, toast, sound, silent, webhook (replaces Visual/Sound combo).
+    .PARAMETER Visual
+        Visual channel: popup, toast, none. Overrides TimerDefaults.Visual.
+    .PARAMETER Sound
+        Play sound when timer completes. Overrides TimerDefaults.Sound.
     .PARAMETER Webhook
-        Named webhook from Config.Webhooks (e.g. discord-main). Used with -Notify webhook.
+        Named webhook from Config.Webhooks (e.g. discord-main). Fires when set.
     .PARAMETER At
         Schedule start at HH:mm today (24h). Timer runs from that time.
     .PARAMETER AfterStart
@@ -3017,8 +3105,9 @@ function Timer {
         t 1h30m 'Stand up' 4
         t pomodoro
         t "(25m work, 5m rest)x4"
+        t 25m -Visual toast -Sound
         t 25m -Notify toast
-        t 25m -Notify webhook -Webhook discord-main
+        t 25m -Webhook discord-main
         t 25m work -At "14:30"
     #>
     param(
@@ -3027,6 +3116,10 @@ function Timer {
         [Parameter(Position=2)][Alias('r')][int]$Repeat = 1,
         [ValidateSet('popup', 'toast', 'sound', 'silent', 'webhook')]
         [string]$Notify = $null,
+        [ValidateSet('popup', 'toast', 'none')]
+        [string]$Visual = $null,
+        [switch]$Sound,
+        [switch]$NoSound,
         [string]$Webhook = $null,
         [string]$At = $null,
         [ValidateSet('none', 'watch', 'list')]
@@ -3041,7 +3134,8 @@ function Timer {
 
     # Check if this is a sequence pattern or preset
     if (Test-TimerSequence -Pattern $Time) {
-        Start-SequenceTimer -Pattern $Time -Notify $Notify -Webhook $Webhook -At $At -AfterStart $AfterStart
+        $soundOverride = if ($Sound) { $true } elseif ($NoSound) { $false } else { $null }
+        Start-SequenceTimer -Pattern $Time -Notify $Notify -Visual $Visual -SoundOverride $soundOverride -Webhook $Webhook -At $At -AfterStart $AfterStart
         return
     }
 
@@ -3070,7 +3164,8 @@ function Timer {
     $endTime = $startTime.AddSeconds($seconds)
     $timerState = if ($scheduledStart) { 'Scheduled' } else { 'Running' }
 
-    $notifySettings = Resolve-TimerNotificationSettings -NotifyOverride $Notify -WebhookOverride $Webhook
+    $soundOverride = if ($Sound) { $true } elseif ($NoSound) { $false } else { $null }
+    $notifySettings = Resolve-TimerNotificationSettings -NotifyOverride $Notify -VisualOverride $Visual -SoundOverride $soundOverride -WebhookOverride $Webhook
 
     $timer = [PSCustomObject]@{
         Id              = $id
@@ -3084,6 +3179,8 @@ function Timer {
         CurrentRun      = 1
         State           = $timerState
         IsSequence      = $false
+        NotifyVisual    = $notifySettings.Visual
+        NotifySound     = $notifySettings.Sound
         NotifyType      = $notifySettings.NotifyType
         WebhookName     = $notifySettings.WebhookName
         TaskName        = New-TimerTaskName -TimerId $id
@@ -3093,7 +3190,7 @@ function Timer {
     $timers += $timer
     Save-TimerData -Timers $timers
 
-    Start-TimerJob -Timer $timer -Notify $notifySettings.NotifyType -WebhookUrl $notifySettings.WebhookUrl
+    Start-TimerJob -Timer $timer -Visual $notifySettings.Visual -Sound $notifySettings.Sound -WebhookUrl $notifySettings.WebhookUrl -SoundFile $notifySettings.SoundFile
 
     Write-Host ""
     if ($timerState -eq 'Scheduled') {
@@ -3118,11 +3215,7 @@ function Timer {
     Write-Host "  Message:  " -ForegroundColor Gray -NoNewline
     Write-Host $Message -ForegroundColor White
     Write-Host "  Notify:   " -ForegroundColor Gray -NoNewline
-    $notifyLabel = $notifySettings.NotifyType
-    if ($notifySettings.NotifyType -eq 'webhook' -and $notifySettings.WebhookName) {
-        $notifyLabel += " ($($notifySettings.WebhookName))"
-    }
-    Write-Host $notifyLabel -ForegroundColor Green
+    Write-Host $notifySettings.Label -ForegroundColor Green
     Write-Host ""
 
     Invoke-TimerAfterStart -TimerId $id -AfterStart $AfterStart
@@ -3135,9 +3228,13 @@ function Start-SequenceTimer {
     .PARAMETER Pattern
         Sequence pattern string or preset name.
     .PARAMETER Notify
-        Notification type: popup (default), toast, sound, silent, webhook.
+        Legacy shorthand: popup, toast, sound, silent, webhook.
+    .PARAMETER Visual
+        Visual channel: popup, toast, none.
+    .PARAMETER SoundOverride
+        Optional sound on/off override.
     .PARAMETER Webhook
-        Named webhook from Config.Webhooks when using -Notify webhook.
+        Named webhook from Config.Webhooks.
     .PARAMETER At
         Schedule sequence start at HH:mm today (24h).
     .PARAMETER AfterStart
@@ -3146,6 +3243,8 @@ function Start-SequenceTimer {
     param(
         [string]$Pattern,
         [string]$Notify = $null,
+        [string]$Visual = $null,
+        $SoundOverride = $null,
         [string]$Webhook = $null,
         [string]$At = $null,
         [string]$AfterStart = $null
@@ -3153,11 +3252,15 @@ function Start-SequenceTimer {
 
     $originalPattern = $Pattern
     $presetNotify = $null
+    $presetVisual = $null
+    $presetSound = $null
     $presetWebhook = $null
     if (($script:TimerPresets.Keys -contains $Pattern)) {
         $preset = $script:TimerPresets[$Pattern]
         $Pattern = $preset.Pattern
         if ($preset.Notify) { $presetNotify = $preset.Notify }
+        if ($preset.Visual) { $presetVisual = $preset.Visual }
+        if ($preset.ContainsKey('Sound')) { $presetSound = [bool]$preset.Sound }
         if ($preset.Webhook) { $presetWebhook = $preset.Webhook }
     }
 
@@ -3188,11 +3291,11 @@ function Start-SequenceTimer {
         }
     }
 
-    $notifySettings = Resolve-TimerNotificationSettings -NotifyOverride $Notify -WebhookOverride $Webhook -PresetNotify $presetNotify -PresetWebhook $presetWebhook
+    $notifySettings = Resolve-TimerNotificationSettings -NotifyOverride $Notify -VisualOverride $Visual -SoundOverride $SoundOverride -WebhookOverride $Webhook -PresetNotify $presetNotify -PresetVisual $presetVisual -PresetSound $presetSound -PresetWebhook $presetWebhook
     $startTime = if ($scheduledStart) { $scheduledStart } else { $now }
     $timerState = if ($scheduledStart) { 'Scheduled' } else { 'Running' }
 
-    $timer = New-SequenceTimerFromPhases -Id $id -OriginalPattern $originalPattern -Phases $phases -Summary $summary -Now $startTime -NotifyType $notifySettings.NotifyType -WebhookName $notifySettings.WebhookName
+    $timer = New-SequenceTimerFromPhases -Id $id -OriginalPattern $originalPattern -Phases $phases -Summary $summary -Now $startTime -NotifyVisual $notifySettings.Visual -NotifySound $notifySettings.Sound -NotifyType $notifySettings.NotifyType -WebhookName $notifySettings.WebhookName
     $timer.State = $timerState
     $firstPhase = $phases[0]
     $timer.EndTime = $startTime.AddSeconds($firstPhase.Seconds).ToString('o')
@@ -3203,7 +3306,7 @@ function Start-SequenceTimer {
     Start-SequenceTimerJob -Timer $timer
 
     $endTime = [DateTime]::Parse($timer.EndTime)
-    Write-SequenceTimerConfirmation -Id $id -OriginalPattern $originalPattern -Summary $summary -PhaseCount $phases.Count -FirstPhase $firstPhase -EndTime $endTime -ScheduledStart $scheduledStart -NotifyLabel $notifySettings.NotifyType -WebhookName $notifySettings.WebhookName
+    Write-SequenceTimerConfirmation -Id $id -OriginalPattern $originalPattern -Summary $summary -PhaseCount $phases.Count -FirstPhase $firstPhase -EndTime $endTime -ScheduledStart $scheduledStart -NotifyLabel $notifySettings.Label
 
     Invoke-TimerAfterStart -TimerId $id -AfterStart $AfterStart
 }

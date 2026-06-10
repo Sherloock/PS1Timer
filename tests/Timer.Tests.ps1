@@ -107,14 +107,18 @@ Describe "Timer" {
             $global:Config = @{
                 Webhooks = @{ 'discord-main' = 'https://example.com/hook' }
             }
+            Initialize-PS1TimerModuleConfig
             Timer -Time "1m" -Notify webhook -Webhook 'discord-main'
 
             $timers = @(Get-TimerData)
+            $timers[0].NotifyVisual | Should -Be 'none'
+            $timers[0].NotifySound | Should -BeFalse
             $timers[0].NotifyType | Should -Be 'webhook'
             $timers[0].WebhookName | Should -Be 'discord-main'
         }
         finally {
             $global:Config = $saved
+            Initialize-PS1TimerModuleConfig
         }
     }
 }
@@ -818,7 +822,7 @@ Describe "Sequence phase advance (JSON)" {
         $summary = Get-SequenceSummary -Phases $phases
         $id = '9'
         $now = Get-Date
-        $timer = New-SequenceTimerFromPhases -Id $id -OriginalPattern 'test' -Phases $phases -Summary $summary -Now $now -NotifyType 'silent'
+        $timer = New-SequenceTimerFromPhases -Id $id -OriginalPattern 'test' -Phases $phases -Summary $summary -Now $now -NotifyVisual 'none' -NotifySound $false -NotifyType 'silent'
         Save-TimerData -Timers @($timer)
 
         $saved = @(Get-TimerData)
@@ -878,6 +882,7 @@ Describe "Fire script generation" {
             $global:Config = @{
                 Webhooks = @{ 'discord' = 'https://example.com/hook' }
             }
+            Initialize-PS1TimerModuleConfig
             Timer -Time '5s' -Message 'Discord test' -Notify webhook -Webhook discord
 
             $scriptPath = Join-Path $env:TEMP 'PSTimer_1.ps1'
@@ -886,9 +891,13 @@ Describe "Fire script generation" {
             $content = Get-Content -LiteralPath $scriptPath -Raw
             $content | Should -Match '\$timerSeconds'
             $content | Should -Not -Match '`\$timerSeconds'
+            $content | Should -Match '\$notifyVisual'
+            $content | Should -Match '\$notifySound'
+            $content | Should -Match 'if \(\$webhookUrl\)'
         }
         finally {
             $global:Config = $saved
+            Initialize-PS1TimerModuleConfig
             $generated = Join-Path $env:TEMP 'PSTimer_1.ps1'
             if (Test-Path -LiteralPath $generated) { Remove-Item -LiteralPath $generated -Force }
         }
@@ -906,15 +915,71 @@ Describe "Resolve-TimerNotificationSettings" {
         $saved = $global:Config
         try {
             $global:Config = @{
-                TimerDefaults = @{ Notify = 'popup' }
+                TimerDefaults = @{ Visual = 'popup'; Sound = $true }
                 Webhooks = @{ 'ntfy' = 'https://ntfy.sh/test' }
             }
+            Initialize-PS1TimerModuleConfig
             $result = Resolve-TimerNotificationSettings -PresetNotify 'webhook' -PresetWebhook 'ntfy'
+            $result.Visual | Should -Be 'none'
+            $result.Sound | Should -BeFalse
             $result.NotifyType | Should -Be 'webhook'
             $result.WebhookUrl | Should -Be 'https://ntfy.sh/test'
         }
         finally {
             $global:Config = $saved
+            Initialize-PS1TimerModuleConfig
+        }
+    }
+
+    It "maps legacy Notify sound to Visual none and Sound true" {
+        $saved = $global:Config
+        try {
+            $global:Config = @{ TimerDefaults = @{ Notify = 'sound' } }
+            Initialize-PS1TimerModuleConfig
+            $result = Resolve-TimerNotificationSettings
+            $result.Visual | Should -Be 'none'
+            $result.Sound | Should -BeTrue
+            $result.Label | Should -Be 'sound'
+        }
+        finally {
+            $global:Config = $saved
+            Initialize-PS1TimerModuleConfig
+        }
+    }
+
+    It "combines Visual toast Sound and Webhook from defaults" {
+        $saved = $global:Config
+        try {
+            $global:Config = @{
+                TimerDefaults = @{ Visual = 'toast'; Sound = $true; Webhook = 'discord' }
+                Webhooks = @{ 'discord' = 'https://example.com/hook' }
+            }
+            Initialize-PS1TimerModuleConfig
+            $result = Resolve-TimerNotificationSettings
+            $result.Visual | Should -Be 'toast'
+            $result.Sound | Should -BeTrue
+            $result.WebhookUrl | Should -Be 'https://example.com/hook'
+            $result.Label | Should -Be 'toast + sound + webhook (discord)'
+        }
+        finally {
+            $global:Config = $saved
+            Initialize-PS1TimerModuleConfig
+        }
+    }
+
+    It "applies preset Visual and Sound overrides" {
+        $saved = $global:Config
+        try {
+            $global:Config = @{ TimerDefaults = @{ Visual = 'popup'; Sound = $true } }
+            Initialize-PS1TimerModuleConfig
+            $result = Resolve-TimerNotificationSettings -PresetVisual 'none' -PresetSound $true
+            $result.Visual | Should -Be 'none'
+            $result.Sound | Should -BeTrue
+            $result.Label | Should -Be 'sound'
+        }
+        finally {
+            $global:Config = $saved
+            Initialize-PS1TimerModuleConfig
         }
     }
 }

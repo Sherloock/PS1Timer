@@ -51,11 +51,12 @@ tw 1                           # progress view for timer #1
 tp 1; tr 1                     # pause / resume
 td done                        # remove completed timers
 
-# Notifications
-t 25m -Notify toast
-t 10m -Notify sound
-t 5m -Notify silent
-t 25m -Notify webhook -Webhook discord-main
+# Notifications (Visual + Sound + optional Webhook)
+t 25m -Visual toast -Sound
+t 10m -Visual none -Sound
+t 5m -Visual none -NoSound
+t 25m -Webhook discord-main
+t 25m -Notify toast   # legacy shorthand
 
 # Stats & scheduled start
 ts                             # today/week completion stats
@@ -108,13 +109,13 @@ Works out of the box — no copy step required.
 | [`config.example.ps1`](config.example.ps1) | Defaults + **19 presets** — loaded automatically when `config.ps1` is absent |
 | `config.ps1` | Optional personal settings (gitignored) — **replaces** the example when present |
 
-`TimerDefaults` keys: `Notify`, `Webhook`, `SoundFile`, `Theme`, `AfterStart` (`none` | `watch` | `list`). `Theme` selects a palette from `Palettes` — each palette has semantic roles (`Primary`, `Success`, `Warning`, …) set to named colors (`cyan`, `green`, `yellow`, …). Named URLs live in `Webhooks` (e.g. `discord-main`).
+`TimerDefaults` keys: `Visual` (`popup` | `toast` | `none`), `Sound` (`$true` | `$false`), `Webhook`, `SoundFile`, `Theme`, `AfterStart` (`none` | `watch` | `list`). Legacy `Notify` still maps to Visual/Sound. `Theme` selects a palette from `Palettes`. Named URLs live in `Webhooks` (e.g. `discord-main`).
 
 To customize:
 
 ```powershell
 Copy-Item config.example.ps1 config.ps1
-# Edit config.ps1 — Presets, TimerDefaults.Notify, TimerDefaults.AfterStart, etc.
+# Edit config.ps1 — Presets, TimerDefaults.Visual/Sound/Webhook, AfterStart, etc.
 ```
 
 Then reload the module:

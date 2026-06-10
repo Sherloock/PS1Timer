@@ -5,7 +5,7 @@
 Start a simple countdown, sequence, or preset.
 
 ```powershell
-Timer -Time 25m -Message "Focus" [-Repeat 3] [-Notify toast|popup|sound|silent] [-AfterStart none|watch|list]
+Timer -Time 25m -Message "Focus" [-Repeat 3] [-Visual popup|toast|none] [-Sound] [-Webhook name] [-AfterStart none|watch|list]
 t 25m
 t pomodoro
 t "(25m work, 5m rest)x2"
@@ -17,7 +17,10 @@ t 25m -AfterStart watch
 | `-Time` | Duration (`25m`, `90s`, `1h30m`) or sequence/preset pattern |
 | `-Message` | Notification text (default: `Time is up!`) |
 | `-Repeat` | Number of runs (default: 1) |
-| `-Notify` | Override default notification mode |
+| `-Visual` | Visual channel: `popup`, `toast`, `none` |
+| `-Sound` / `-NoSound` | Enable or disable sound |
+| `-Webhook` | Named webhook from `Config.Webhooks` |
+| `-Notify` | Legacy shorthand: `popup`, `toast`, `sound`, `silent`, `webhook` |
 | `-AfterStart` | After start: `none` (default), `watch` (`tw <id>`), `list` (`tl -w`). Default from `TimerDefaults.AfterStart` in config |
 
 Bare `t` or `Timer` with no arguments shows the help menu.

@@ -326,12 +326,27 @@ Describe "Module configuration loading" {
             . (Join-Path $ModuleRoot 'config.example.ps1')
             Initialize-PS1TimerModuleConfig
             $cfg = Get-TimerNotificationConfig
-            $cfg.Notify | Should -Be 'sound'
+            $cfg.Visual | Should -Be 'none'
+            $cfg.Sound | Should -BeTrue
         }
         finally {
             $global:Config = $saved
             Initialize-PS1TimerModuleConfig
         }
+    }
+}
+
+Describe "ConvertFrom-LegacyNotifyMode" {
+    It "maps sound to none visual with sound on" {
+        $result = ConvertFrom-LegacyNotifyMode -Notify 'sound'
+        $result.Visual | Should -Be 'none'
+        $result.Sound | Should -BeTrue
+    }
+
+    It "maps silent to none visual with sound off" {
+        $result = ConvertFrom-LegacyNotifyMode -Notify 'silent'
+        $result.Visual | Should -Be 'none'
+        $result.Sound | Should -BeFalse
     }
 }
 

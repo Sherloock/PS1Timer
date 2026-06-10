@@ -8,17 +8,44 @@
 #   Edit config.ps1 (gitignored)
 #
 # When config.ps1 exists, it replaces this file entirely (not merged).
+#
+# Reload after editing config.ps1 (config is read only at module import):
+#
+#   From the PS1Timer folder:
+#     Import-Module .\PS1Timer.psd1 -Force
+#
+#   If your profile dot-sources loader.ps1:
+#     . .\loader.ps1
+#
+#   If your profile uses dotfile PS1Timer-LazyLoad.ps1:
+#     Reload-PS1Timer
+#
+# New PowerShell sessions pick up config.ps1 automatically when the module loads.
 
 $global:Config = @{
     # TimerDefaults — applied to every new timer unless overridden per command
     TimerDefaults = @{
-        # Notification: popup | toast | sound | silent | webhook
-        Notify = 'sound'
-
-        # Default named webhook when Notify = webhook (key from Webhooks below)
+        # Notifications — three independent channels (combine freely):
+        #
+        #   Visual  popup | toast | none
+        #     popup — modal dialog (blocks until OK)
+        #     toast — system-tray balloon (~10s, non-blocking)
+        #     none  — no UI
+        #
+        #   Sound   $true | $false — console beep or SoundFile when $true
+        #
+        #   Webhook named key from Webhooks below — POST when set (additive)
+        #
+        # Override per timer:  t 25m -Visual toast -Sound -Webhook discord-main
+        # Override per preset:  Visual = 'none'; Sound = $true  (see tabata)
+        # Legacy shorthand:     t 25m -Notify sound  (maps to Visual/Sound)
+        #
+        # Priority: -Notify > -Visual/-Sound/-Webhook > preset > TimerDefaults
+        Visual  = 'none'
+        Sound   = $true
         Webhook = $null
 
-        # Optional .wav for sound mode (null = console beep)
+        # SoundFile — optional .wav when Sound = $true (null = built-in beep)
         SoundFile = $null
 
         # UI theme — name from Palettes below (default | minimal | vibrant | monochrome | your own)
@@ -90,7 +117,8 @@ $global:Config = @{
         }
     }
 
-    # Named webhook URLs — use with -Notify webhook -Webhook "name"
+    # Webhooks — named URLs; reference via TimerDefaults.Webhook or  t 25m -Webhook discord-main
+    # Discord and ntfy.sh work out of the box; payload is { "content": "..." }.
     Webhooks = @{
         # 'discord-main' = 'https://discord.com/api/webhooks/...'
         # 'ntfy-phone'   = 'https://ntfy.sh/my-topic'
@@ -144,7 +172,8 @@ $global:Config = @{
         }
         'tabata' = @{
             Pattern     = '(20s work, 10s rest)x8'
-            Notify      = 'sound'
+            Visual      = 'none'
+            Sound       = $true
             Description = 'Tabata HIIT interval (4 minutes)'
         }
         'cooking-pasta' = @{

@@ -481,6 +481,88 @@ function Get-PS1TimerModulePalettes {
     return $null
 }
 
+function ConvertFrom-LegacyNotifyMode {
+    <#
+    .SYNOPSIS
+        Maps legacy Notify enum to composable Visual/Sound channels.
+    #>
+    param([string]$Notify)
+
+    switch ($Notify.ToLower()) {
+        'toast'   { return @{ Visual = 'toast'; Sound = $true } }
+        'sound'   { return @{ Visual = 'none'; Sound = $true } }
+        'silent'  { return @{ Visual = 'none'; Sound = $false } }
+        'webhook' { return @{ Visual = 'none'; Sound = $false } }
+        default   { return @{ Visual = 'popup'; Sound = $true } }
+    }
+}
+
+function Get-TimerNotifyChannelsFromSource {
+    <#
+    .SYNOPSIS
+        Reads Visual/Sound from a config or preset hashtable, with legacy Notify fallback.
+    #>
+    param([hashtable]$Source)
+
+    if (-not $Source) {
+        return @{ Visual = 'popup'; Sound = $true }
+    }
+
+    $hasVisual = $Source.ContainsKey('Visual') -and -not [string]::IsNullOrWhiteSpace([string]$Source.Visual)
+    $hasSound = $Source.ContainsKey('Sound')
+
+    if ($hasVisual -or $hasSound) {
+        $visual = if ($hasVisual) { "$($Source.Visual)".ToLower() } else { 'popup' }
+        $sound = if ($hasSound) { [bool]$Source.Sound } else { $true }
+        return @{ Visual = $visual; Sound = $sound }
+    }
+
+    if ($Source.Notify) {
+        return ConvertFrom-LegacyNotifyMode -Notify $Source.Notify
+    }
+
+    return @{ Visual = 'popup'; Sound = $true }
+}
+
+function Get-TimerNotifyChannelsFromTimer {
+    <#
+    .SYNOPSIS
+        Resolves Visual/Sound from a timer object (new fields or legacy NotifyType).
+    #>
+    param([PSCustomObject]$Timer)
+
+    if ($Timer.PSObject.Properties.Name -contains 'NotifyVisual') {
+        $visual = if ($Timer.NotifyVisual) { "$($Timer.NotifyVisual)".ToLower() } else { 'popup' }
+        $sound = if ($Timer.PSObject.Properties.Name -contains 'NotifySound') { [bool]$Timer.NotifySound } else { $true }
+        return @{ Visual = $visual; Sound = $sound }
+    }
+
+    if ($Timer.PSObject.Properties.Name -contains 'NotifyType' -and $Timer.NotifyType) {
+        return ConvertFrom-LegacyNotifyMode -Notify $Timer.NotifyType
+    }
+
+    return @{ Visual = 'popup'; Sound = $true }
+}
+
+function Format-TimerNotifyLabel {
+    <#
+    .SYNOPSIS
+        Builds a human-readable notify summary for confirmation output.
+    #>
+    param(
+        [string]$Visual,
+        [bool]$Sound,
+        [string]$WebhookName = $null
+    )
+
+    $parts = @()
+    if ($Visual -and $Visual -ne 'none') { $parts += $Visual }
+    if ($Sound) { $parts += 'sound' }
+    if (-not [string]::IsNullOrWhiteSpace($WebhookName)) { $parts += "webhook ($WebhookName)" }
+    if ($parts.Count -eq 0) { return 'silent' }
+    return ($parts -join ' + ')
+}
+
 function Assert-TimerConfig {
     <#
     .SYNOPSIS
@@ -489,6 +571,7 @@ function Assert-TimerConfig {
     if (-not $global:Config) { return }
 
     $validNotify = @('popup', 'toast', 'sound', 'silent', 'webhook')
+    $validVisual = @('popup', 'toast', 'none')
     $validAfterStart = @('none', 'watch', 'list')
     $paletteSource = if ($global:Config.Palettes) { $global:Config.Palettes } else { Get-DefaultTimerPalettes }
     $validThemes = @($paletteSource.Keys | ForEach-Object { "$_".ToLower() }) | Select-Object -Unique
@@ -499,6 +582,13 @@ function Assert-TimerConfig {
 
         if ($td.Notify -and ($validNotify -notcontains $td.Notify.ToLower())) {
             Write-Warning "PS1Timer: TimerDefaults.Notify '$($td.Notify)' is invalid. Use: $($validNotify -join ', ')"
+        }
+        elseif ($td.Notify) {
+            Write-Warning 'PS1Timer: TimerDefaults.Notify is deprecated. Use Visual, Sound, and Webhook instead.'
+        }
+
+        if ($td.Visual -and ($validVisual -notcontains $td.Visual.ToLower())) {
+            Write-Warning "PS1Timer: TimerDefaults.Visual '$($td.Visual)' is invalid. Use: $($validVisual -join ', ')"
         }
 
         if ($td.AfterStart -and ($validAfterStart -notcontains $td.AfterStart)) {
@@ -563,6 +653,9 @@ function Assert-TimerConfig {
             $preset = $global:Config.Presets[$presetName]
             if ($preset.Notify -and ($validNotify -notcontains $preset.Notify.ToLower())) {
                 Write-Warning "PS1Timer: Presets['$presetName'].Notify '$($preset.Notify)' is invalid."
+            }
+            if ($preset.Visual -and ($validVisual -notcontains $preset.Visual.ToLower())) {
+                Write-Warning "PS1Timer: Presets['$presetName'].Visual '$($preset.Visual)' is invalid."
             }
             if ($preset.Webhook -and -not (Resolve-TimerWebhookUrl -Name $preset.Webhook)) {
                 Write-Warning "PS1Timer: Presets['$presetName'].Webhook '$($preset.Webhook)' not found in Config.Webhooks."
