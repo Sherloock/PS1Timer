@@ -26,6 +26,7 @@ All notable changes to PS1Timer are documented here.
 
 ### Fixed
 
+- Sequence timers no longer complete early after `tp` / `tr` (resume now re-registers sequence fire script)
 - VBS launcher uses `Chr(34)` quoting so `pwsh` under `Program Files` no longer breaks scheduled tasks
 - Preset/sequence timers advance to phase 2+ (pwsh fire script, `@(Phases)` coercion, register-then-save, live `TaskName`)
 - Scheduled-task registration no longer blocks the CLI (~3s delay); registers in a background job

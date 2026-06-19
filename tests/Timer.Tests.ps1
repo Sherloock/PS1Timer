@@ -308,6 +308,118 @@ Describe "TimerResume" {
         $timers = @(Get-TimerData)
         $timers[0].State | Should -Be "Completed"
     }
+
+    It "resumes paused simple timer with simple fire script" {
+        $timer = [PSCustomObject]@{
+            Id               = '2'
+            Duration         = '5m'
+            Seconds          = 300
+            Message          = 'Test'
+            StartTime        = (Get-Date).AddSeconds(-60).ToString('o')
+            EndTime          = (Get-Date).AddSeconds(240).ToString('o')
+            RepeatTotal      = 1
+            RepeatRemaining  = 0
+            CurrentRun       = 1
+            State            = 'Paused'
+            RemainingSeconds = 240
+            IsSequence       = $false
+        }
+        Save-TimerData -Timers @($timer)
+
+        TimerResume -Id '2'
+
+        $scriptPath = Join-Path $env:TEMP 'PSTimer_2.ps1'
+        try {
+            Test-Path -LiteralPath $scriptPath | Should -BeTrue
+            $content = Get-Content -LiteralPath $scriptPath -Raw
+            $content | Should -Match '\$repeatRemaining'
+            $content | Should -Not -Match '\$nextPhaseIdx'
+        }
+        finally {
+            if (Test-Path -LiteralPath $scriptPath) { Remove-Item -LiteralPath $scriptPath -Force }
+            $vbsPath = Join-Path $env:TEMP 'PSTimer_2.vbs'
+            if (Test-Path -LiteralPath $vbsPath) { Remove-Item -LiteralPath $vbsPath -Force }
+        }
+    }
+
+    It "resumes paused sequence timer with sequence fire script" {
+        $phases = @(
+            @{ Seconds = 10; Label = 'a'; Duration = '10s' }
+            @{ Seconds = 10; Label = 'b'; Duration = '10s' }
+            @{ Seconds = 10; Label = 'c'; Duration = '10s' }
+        )
+        $timer = [PSCustomObject]@{
+            Id               = '3'
+            Duration         = '30s'
+            Seconds          = 10
+            Message          = 'b'
+            StartTime        = (Get-Date).AddSeconds(-5).ToString('o')
+            EndTime          = (Get-Date).AddSeconds(5).ToString('o')
+            RepeatTotal      = 1
+            RepeatRemaining  = 0
+            CurrentRun       = 1
+            State            = 'Paused'
+            RemainingSeconds = 120
+            IsSequence       = $true
+            SequencePattern  = '(10s a, 10s b, 10s c)x1'
+            Phases           = $phases
+            CurrentPhase     = 1
+            TotalPhases      = 3
+            PhaseLabel       = 'b'
+            TotalSeconds     = 30
+            NotifyVisual     = 'none'
+            NotifySound      = $false
+        }
+        Save-TimerData -Timers @($timer)
+
+        TimerResume -Id '3'
+
+        $timers = @(Get-TimerData)
+        $timers[0].State | Should -Be 'Running'
+        $timers[0].CurrentPhase | Should -Be 1
+
+        $scriptPath = Join-Path $env:TEMP 'PSTimer_3.ps1'
+        try {
+            Test-Path -LiteralPath $scriptPath | Should -BeTrue
+            $content = Get-Content -LiteralPath $scriptPath -Raw
+            $content | Should -Match 'if \(-not \$timer\.IsSequence\) \{ exit \}'
+            $content | Should -Match '\$nextPhaseIdx'
+            $content | Should -Not -Match '\$repeatRemaining -gt 0'
+        }
+        finally {
+            if (Test-Path -LiteralPath $scriptPath) { Remove-Item -LiteralPath $scriptPath -Force }
+            $vbsPath = Join-Path $env:TEMP 'PSTimer_3.vbs'
+            if (Test-Path -LiteralPath $vbsPath) { Remove-Item -LiteralPath $vbsPath -Force }
+        }
+    }
+}
+
+Describe "Start-TimerScheduledJob" {
+    BeforeEach {
+        Reset-TimerDataCacheForTests
+    }
+
+    It "routes sequence timers to Start-SequenceTimerJob" {
+        Mock Start-SequenceTimerJob { }
+        Mock Start-TimerJob { }
+
+        $timer = [PSCustomObject]@{ Id = '1'; IsSequence = $true }
+        Start-TimerScheduledJob -Timer $timer
+
+        Assert-MockCalled Start-SequenceTimerJob -Times 1 -Exactly
+        Assert-MockCalled Start-TimerJob -Times 0 -Exactly
+    }
+
+    It "routes simple timers to Start-TimerJob" {
+        Mock Start-SequenceTimerJob { }
+        Mock Start-TimerJob { }
+
+        $timer = [PSCustomObject]@{ Id = '1'; IsSequence = $false }
+        Start-TimerScheduledJob -Timer $timer
+
+        Assert-MockCalled Start-TimerJob -Times 1 -Exactly
+        Assert-MockCalled Start-SequenceTimerJob -Times 0 -Exactly
+    }
 }
 
 # ============================================================================

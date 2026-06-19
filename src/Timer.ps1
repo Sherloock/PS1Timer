@@ -200,15 +200,7 @@ function Invoke-TimerFireScriptRecovery {
     }
     catch {
         "$(Get-Date -Format 'o') WARN fire script parse, regenerating: $($_.Exception.Message)" | Add-Content -LiteralPath $log -Force
-        if ($Timer.IsSequence) {
-            Start-SequenceTimerJob -Timer $Timer
-        }
-        else {
-            $channels = Get-TimerNotifyChannelsFromTimer -Timer $Timer
-            $webhookUrl = if ($Timer.WebhookName) { Resolve-TimerWebhookUrl -Name $Timer.WebhookName } else { $null }
-            $soundFile = (Get-TimerNotificationConfig).SoundFile
-            Start-TimerJob -Timer $Timer -Visual $channels.Visual -Sound $channels.Sound -WebhookUrl $webhookUrl -SoundFile $soundFile
-        }
+        Start-TimerScheduledJob -Timer $Timer
         try {
             $null = [scriptblock]::Create((Get-Content -LiteralPath $scriptPath -Raw))
         }
@@ -2399,7 +2391,7 @@ function Invoke-ResumeTimersBulk {
         $t.State = 'Running'
         $t | Add-Member -NotePropertyName 'RemainingSeconds' -NotePropertyValue $null -Force
         $t | Add-Member -NotePropertyName 'TaskName' -NotePropertyValue (New-TimerTaskName -TimerId $t.Id) -Force
-        Start-TimerJob -Timer $t
+        Start-TimerScheduledJob -Timer $t
         $count++
     }
     Save-TimerData -Timers $Timers
@@ -2425,7 +2417,7 @@ function Invoke-ResumeSingleTimer {
     $timer.State = 'Running'
     $timer | Add-Member -NotePropertyName 'RemainingSeconds' -NotePropertyValue $null -Force
     $timer | Add-Member -NotePropertyName 'TaskName' -NotePropertyValue (New-TimerTaskName -TimerId $timer.Id) -Force
-    Start-TimerJob -Timer $timer
+    Start-TimerScheduledJob -Timer $timer
     Save-TimerData -Timers $Timers
     return @{ Found = $true; CanResume = $true; IsLost = $isLost; NewEndTime = $newEndTime }
 }
@@ -3035,6 +3027,24 @@ $historyBlock
 
     Register-TimerScheduledTaskAsync -TimerId $Timer.Id -TaskName $taskName -TriggerTime $triggerTime -VbsPath $vbsPath
     $Timer | Add-Member -NotePropertyName 'TaskName' -NotePropertyValue $taskName -Force
+}
+
+function Start-TimerScheduledJob {
+    <#
+    .SYNOPSIS
+        Registers the correct scheduled task fire script for a timer record (simple, repeat, or sequence).
+    #>
+    param([PSCustomObject]$Timer)
+
+    if ($Timer.IsSequence) {
+        Start-SequenceTimerJob -Timer $Timer
+    }
+    else {
+        $channels = Get-TimerNotifyChannelsFromTimer -Timer $Timer
+        $webhookUrl = if ($Timer.WebhookName) { Resolve-TimerWebhookUrl -Name $Timer.WebhookName } else { $null }
+        $soundFile = (Get-TimerNotificationConfig).SoundFile
+        Start-TimerJob -Timer $Timer -Visual $channels.Visual -Sound $channels.Sound -WebhookUrl $webhookUrl -SoundFile $soundFile
+    }
 }
 # endregion Timer-Sequence.ps1
 

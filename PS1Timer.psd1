@@ -24,7 +24,7 @@
         'Play-TimerSound', 'Save-TimerData', 'Show-MenuPicker', 'Show-TimerHelp', 'Show-TimerListOnce',
         'Show-TimerListWatch', 'Show-TimerNotification', 'Show-TimerNotificationHelp', 'Show-TimerPopup',
         'Show-TimerToast', 'Show-TimerWatchDisplay', 'Start-SequenceTimer', 'Start-SequenceTimerJob',
-        'Start-TimerJob', 'Stop-TimerTask', 'Sync-TimerData', 'Test-TimerIsActiveDisplay',
+        'Start-TimerJob', 'Start-TimerScheduledJob', 'Stop-TimerTask', 'Sync-TimerData', 'Test-TimerIsActiveDisplay',
         'Test-TimerSequence', 'Timer', 'Timer-List', 'Timer-Pause', 'Timer-Presets', 'Timer-Remove',
         'Timer-Resume', 'Timer-Stats', 'Timer-Watch', 'TimerList', 'TimerPause', 'TimerPresets', 'TimerRemove',
         'TimerResume', 'TimerStats', 'TimerWatch', 'Wait-OneSecondOrKeyPress', 'Write-HelpMenu',

@@ -20,6 +20,14 @@
 
 **Note:** `t` returns immediately while the scheduled task registers in the background (about 1–2 seconds). If registration fails, the timer is marked `Paused` with remaining time preserved.
 
+## Sequence completes after pause/resume (`tp` then `tr`)
+
+**Symptoms:** You pause a multi-phase sequence mid-phase, resume it, and the timer shows **Completed** after that phase instead of advancing to the next phase.
+
+**Cause:** Older builds re-registered a simple-timer fire script on resume. When the phase ended, `RepeatRemaining = 0` marked the whole sequence done.
+
+**Fix:** Update PS1Timer (resume uses `Start-TimerScheduledJob`, which picks the sequence fire script for `IsSequence` timers). Reload the module, remove the broken timer if needed (`td <id>`), start again.
+
 ## Commands feel slow (~3 seconds)
 
 Older versions blocked on `Register-ScheduledTask` for every `t` command. Current builds register in the background; confirmation should appear instantly. `tl` is also faster when timers still have time left (no per-timer task scan).
