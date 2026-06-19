@@ -37,7 +37,7 @@ $global:Config = @{
 }
 ```
 
-Reload: `Import-Module .\PS1Timer.psd1 -Force` or `Reload-PS1Timer` (lazy-load profile).
+Reload: `. .\loader.ps1` or `Reload-PS1Timer` (lazy-load profile). Alternatively: `Import-Module .\PS1Timer.psd1 -Force -DisableNameChecking`.
 
 ## Per-timer override
 

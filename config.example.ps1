@@ -12,7 +12,8 @@
 # Reload after editing config.ps1 (config is read only at module import):
 #
 #   From the PS1Timer folder:
-#     Import-Module .\PS1Timer.psd1 -Force
+#     . .\loader.ps1
+#     # or: Import-Module .\PS1Timer.psd1 -Force -DisableNameChecking
 #
 #   If your profile dot-sources loader.ps1:
 #     . .\loader.ps1
@@ -125,22 +126,23 @@ $global:Config = @{
     }
 
     # Sounds — Windows Media .wav presets; reference via TimerDefaults.SoundFile = 'notify'
+    # Use Join-Path (not "$env:windir\Media\Windows ...") — double-quoted \Windows paths can corrupt.
     # Preview: Resolve-TimerSoundFilePath -Name 'notify' | % { (New-Object System.Media.SoundPlayer $_).PlaySync() }
     Sounds = @{
-        notify            = "$env:windir\Media\notify.wav"
-        ding              = "$env:windir\Media\ding.wav"
-        chimes            = "$env:windir\Media\chimes.wav"
-        chord             = "$env:windir\Media\chord.wav"
-        'win-notify'      = "$env:windir\Media\Windows Notify.wav"
-        'win-ding'        = "$env:windir\Media\Windows Ding.wav"
-        tada              = "$env:windir\Media\tada.wav"
-        'alarm-soft'      = "$env:windir\Media\Alarm01.wav"
-        'alarm-loud'      = "$env:windir\Media\Alarm06.wav"
-        ring              = "$env:windir\Media\Ring01.wav"
-        'win-calendar'    = "$env:windir\Media\Windows Notify Calendar.wav"
-        'win-email'       = "$env:windir\Media\Windows Notify Email.wav"
-        'win-exclamation' = "$env:windir\Media\Windows Exclamation.wav"
-        'win-critical'    = "$env:windir\Media\Windows Critical Stop.wav"
+        notify            = (Join-Path $env:windir 'Media\notify.wav')
+        ding              = (Join-Path $env:windir 'Media\ding.wav')
+        chimes            = (Join-Path $env:windir 'Media\chimes.wav')
+        chord             = (Join-Path $env:windir 'Media\chord.wav')
+        'win-notify'      = (Join-Path $env:windir 'Media\Windows Notify.wav')
+        'win-ding'        = (Join-Path $env:windir 'Media\Windows Ding.wav')
+        tada              = (Join-Path $env:windir 'Media\tada.wav')
+        'alarm-soft'      = (Join-Path $env:windir 'Media\Alarm01.wav')
+        'alarm-loud'      = (Join-Path $env:windir 'Media\Alarm06.wav')
+        ring              = (Join-Path $env:windir 'Media\Ring01.wav')
+        'win-calendar'    = (Join-Path $env:windir 'Media\Windows Notify Calendar.wav')
+        'win-email'       = (Join-Path $env:windir 'Media\Windows Notify Email.wav')
+        'win-exclamation' = (Join-Path $env:windir 'Media\Windows Exclamation.wav')
+        'win-critical'    = (Join-Path $env:windir 'Media\Windows Critical Stop.wav')
     }
 
     # Presets — sequence patterns by name (t pomodoro, tpre)

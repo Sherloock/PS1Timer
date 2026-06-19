@@ -12,7 +12,7 @@ PS1Timer does not run on Linux or macOS. The scheduled-task backend is Windows-s
 ```powershell
 git clone https://github.com/Sherloock/PS1Timer.git
 Set-Location PS1Timer
-Import-Module .\PS1Timer.psd1 -Force
+. .\loader.ps1
 ```
 
 Verify:
@@ -47,7 +47,8 @@ Edit `config.ps1` for default notifications and custom presets. When `config.ps1
 Reload after changes:
 
 ```powershell
-Import-Module .\PS1Timer.psd1 -Force
+. .\loader.ps1
+# or: Import-Module .\PS1Timer.psd1 -Force -DisableNameChecking
 ```
 
 ## Upgrading
@@ -55,7 +56,7 @@ Import-Module .\PS1Timer.psd1 -Force
 ```powershell
 Set-Location PS1Timer
 git pull
-Import-Module .\PS1Timer.psd1 -Force
+. .\loader.ps1
 ```
 
 If you use `loader.ps1` in your profile, the next shell session picks up changes automatically. Personal settings in `config.ps1` are preserved across `git pull`.

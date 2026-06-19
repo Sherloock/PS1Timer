@@ -48,7 +48,7 @@ Presets = @{
 }
 ```
 
-Reload: `Import-Module .\PS1Timer.psd1 -Force`
+Reload: `. .\loader.ps1` or `Import-Module .\PS1Timer.psd1 -Force -DisableNameChecking`
 
 ## Deprecated: TimerPresets
 

@@ -438,6 +438,50 @@ Describe "Resolve-TimerSoundFilePath" {
     }
 }
 
+Describe "Assert-TimerConfig" {
+    It "does not warn when win-critical sound path exists" {
+        Mock Test-Path { $true }
+        $warnMessages = [System.Collections.Generic.List[string]]::new()
+        Mock Write-Warning { param($Message) $warnMessages.Add([string]$Message) }
+        $saved = $global:Config
+        try {
+            $global:Config = @{
+                Sounds = @{
+                    'win-critical' = (Join-Path $env:windir 'Media\Windows Critical Stop.wav')
+                }
+            }
+            Initialize-PS1TimerModuleConfig
+            Assert-TimerConfig
+            ($warnMessages | Where-Object { $_ -match "Sounds\['win-critical'\]" }) | Should -BeNullOrEmpty
+        }
+        finally {
+            $global:Config = $saved
+            Initialize-PS1TimerModuleConfig
+        }
+    }
+
+    It "warns when win-critical sound path is missing" {
+        Mock Test-Path { $false }
+        $warnMessages = [System.Collections.Generic.List[string]]::new()
+        Mock Write-Warning { param($Message) $warnMessages.Add([string]$Message) }
+        $saved = $global:Config
+        try {
+            $global:Config = @{
+                Sounds = @{
+                    'win-critical' = (Join-Path $env:windir 'Media\Windows Critical Stop.wav')
+                }
+            }
+            Initialize-PS1TimerModuleConfig
+            Assert-TimerConfig
+            ($warnMessages | Where-Object { $_ -match "Sounds\['win-critical'\]" }).Count | Should -BeGreaterThan 0
+        }
+        finally {
+            $global:Config = $saved
+            Initialize-PS1TimerModuleConfig
+        }
+    }
+}
+
 Describe "Resolve-TimerWebhookUrl" {
     It "resolves named webhook from config" {
         $saved = $global:Config

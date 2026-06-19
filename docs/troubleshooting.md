@@ -81,7 +81,7 @@ Then start a new timer.
 ## Commands not found after install
 
 ```powershell
-Import-Module C:\path\to\PS1Timer\PS1Timer.psd1 -Force
+. C:\path\to\PS1Timer\loader.ps1
 Get-Command t
 ```
 
@@ -118,7 +118,23 @@ Requires Pester 5.x — `Run-Tests.ps1` installs it if missing.
 Presets live in `config.example.ps1` / `config.ps1` under `Presets`. After editing, reload:
 
 ```powershell
-Import-Module .\PS1Timer.psd1 -Force
+. .\loader.ps1
+# or: Import-Module .\PS1Timer.psd1 -Force -DisableNameChecking
 ```
 
 Custom presets belong in `config.ps1` under `Presets`.
+
+## Unapproved verb warning on import
+
+**Symptom:** `The names of some imported commands from the module 'PS1Timer' include unapproved verbs...`
+
+**Cause:** `Import-Module .\PS1Timer.psd1 -Force` without `-DisableNameChecking`. PS1Timer uses domain names (`Timer`, `Timer-List`, …) by design.
+
+**Fix:** Reload via `loader.ps1` (recommended) or add the flag:
+
+```powershell
+. .\loader.ps1
+# or: Import-Module .\PS1Timer.psd1 -Force -DisableNameChecking
+```
+
+Do not use bare `Import-Module -Force` without `-DisableNameChecking`.
