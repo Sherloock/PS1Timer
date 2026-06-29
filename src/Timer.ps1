@@ -956,6 +956,18 @@ function Get-TimerWatchProgressBar {
     return '  ' + $barColor + $filled + $Colors.Dim + $empty + $Colors.Reset + '  ' + $Colors.Bold + $pct + $Colors.Reset
 }
 
+function Get-TimerWatchNotifyLabel {
+    <#
+    .SYNOPSIS
+        Builds notify summary for timer watch display.
+    #>
+    param([PSCustomObject]$Timer)
+
+    $channels = Get-TimerNotifyChannelsFromTimer -Timer $Timer
+    $webhookName = if ($Timer.PSObject.Properties.Name -contains 'WebhookName') { $Timer.WebhookName } else { $null }
+    return Format-TimerNotifyLabel -Visual $channels.Visual -Sound $channels.Sound -WebhookName $webhookName
+}
+
 function Get-TimerWatchCompletedContent {
     <#
     .SYNOPSIS
@@ -965,7 +977,8 @@ function Get-TimerWatchCompletedContent {
         [hashtable]$Colors,
         [string]$Message,
         [int]$TotalSeconds,
-        [DateTime]$EndTime
+        [DateTime]$EndTime,
+        [PSCustomObject]$Timer = $null
     )
     $durStr = Format-Duration -Seconds $TotalSeconds
     $endStr = $EndTime.ToString('HH:mm:ss')
@@ -978,6 +991,10 @@ function Get-TimerWatchCompletedContent {
     [void]$sb.AppendLine((Format-TimerWatchRow -Colors $c -Label 'Message' -Value $Message))
     [void]$sb.AppendLine((Format-TimerWatchRow -Colors $c -Label 'Duration' -Value $durStr))
     [void]$sb.AppendLine((Format-TimerWatchRow -Colors $c -Label 'Finished' -Value $endStr -ValueAnsi $c.Success))
+    if ($Timer) {
+        $notifyLabel = Get-TimerWatchNotifyLabel -Timer $Timer
+        [void]$sb.AppendLine((Format-TimerWatchRow -Colors $c -Label 'Notify' -Value $notifyLabel -ValueAnsi $c.Success))
+    }
     [void]$sb.AppendLine('')
     [void]$sb.AppendLine((Get-TimerWatchProgressBar -Colors $c -Percent 100))
     [void]$sb.AppendLine('')
@@ -1038,6 +1055,9 @@ function Get-TimerWatchRunningContent {
             [void]$sb.AppendLine((Format-TimerWatchRow -Colors $c -Label 'Repeat' -Value $repStr -ValueAnsi $c.Accent))
         }
     }
+
+    $notifyLabel = Get-TimerWatchNotifyLabel -Timer $CurrentTimer
+    [void]$sb.AppendLine((Format-TimerWatchRow -Colors $c -Label 'Notify' -Value $notifyLabel -ValueAnsi $c.Success))
 
     $showFinalEnd = $CurrentTimer.IsSequence -or ([int]$CurrentTimer.RepeatTotal -gt 1)
     $now = Get-Date
@@ -3660,7 +3680,8 @@ function Write-TimerWatchCompletedScreen {
         $TotalSeconds
     }
     Clear-Host
-    $sb = Get-TimerWatchCompletedContent -Colors $Colors -Message $msg -TotalSeconds $secs -EndTime $EndTime
+    $notifyTimer = if ($CurrentTimer) { $CurrentTimer } else { $Timer }
+    $sb = Get-TimerWatchCompletedContent -Colors $Colors -Message $msg -TotalSeconds $secs -EndTime $EndTime -Timer $notifyTimer
     [Console]::Write($sb.ToString())
 }
 

@@ -756,6 +756,71 @@ Describe "Get-TimerWatchRunningContent" {
         $text | Should -Match '12:30:00'
         $text | Should -Not -Match 'Ends       '
     }
+
+    It "includes Notify row with sound and webhook label" {
+        $now = [DateTime]::new(2024, 6, 1, 12, 0, 0)
+        $endTime = $now.AddMinutes(25)
+        $currentTimer = [PSCustomObject]@{
+            IsSequence    = $false
+            Seconds       = 1500
+            EndTime       = $endTime.ToString('o')
+            StartTime     = $now.ToString('o')
+            State         = 'Running'
+            Message       = 'Focus'
+            RepeatTotal   = 1
+            RepeatRemaining = 0
+            NotifyVisual  = 'none'
+            NotifySound   = $true
+            WebhookName   = 'timer'
+        }
+        $timer = [PSCustomObject]@{ Id = '1'; Message = 'Focus'; Seconds = 1500; RepeatTotal = 1 }
+        Mock Get-Date { return $now }
+        $colors = Get-AnsiColors
+        $content = Get-TimerWatchRunningContent -Colors $colors -CurrentTimer $currentTimer -Timer $timer -Percent 50 -Remaining ([TimeSpan]::FromMinutes(12)) -EndsAtFormatted $endTime.ToString('HH:mm:ss')
+        $plain = ($content.ToString() -replace '\x1b\[[0-9;]*m', '')
+        $plain | Should -Match 'Notify'
+        $plain | Should -Match 'sound \+ webhook \(timer\)'
+    }
+
+    It "includes Notify row with silent label" {
+        $now = [DateTime]::new(2024, 6, 1, 12, 0, 0)
+        $endTime = $now.AddMinutes(5)
+        $currentTimer = [PSCustomObject]@{
+            IsSequence    = $false
+            Seconds       = 300
+            EndTime       = $endTime.ToString('o')
+            StartTime     = $now.ToString('o')
+            State         = 'Running'
+            Message       = 'Quiet'
+            RepeatTotal   = 1
+            RepeatRemaining = 0
+            NotifyVisual  = 'none'
+            NotifySound   = $false
+        }
+        $timer = [PSCustomObject]@{ Id = '2'; Message = 'Quiet'; Seconds = 300; RepeatTotal = 1 }
+        Mock Get-Date { return $now }
+        $colors = Get-AnsiColors
+        $content = Get-TimerWatchRunningContent -Colors $colors -CurrentTimer $currentTimer -Timer $timer -Percent 10 -Remaining ([TimeSpan]::FromMinutes(4)) -EndsAtFormatted $endTime.ToString('HH:mm:ss')
+        $plain = ($content.ToString() -replace '\x1b\[[0-9;]*m', '')
+        $plain | Should -Match 'Notify'
+        $plain | Should -Match 'silent'
+    }
+}
+
+Describe "Get-TimerWatchCompletedContent" {
+    It "includes Notify row when timer is provided" {
+        $endTime = [DateTime]::new(2024, 6, 1, 12, 25, 0)
+        $timer = [PSCustomObject]@{
+            NotifyVisual = 'none'
+            NotifySound  = $true
+            WebhookName  = 'timer'
+        }
+        $colors = Get-AnsiColors
+        $content = Get-TimerWatchCompletedContent -Colors $colors -Message 'Focus' -TotalSeconds 1500 -EndTime $endTime -Timer $timer
+        $plain = ($content.ToString() -replace '\x1b\[[0-9;]*m', '')
+        $plain | Should -Match 'Notify'
+        $plain | Should -Match 'sound \+ webhook \(timer\)'
+    }
 }
 
 Describe "Get-TimerWatchPhaseTimelineContent" {
