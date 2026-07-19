@@ -35,16 +35,25 @@ $global:Config = @{
         #
         #   Sound   $true | $false — console beep or SoundFile when $true
         #
+        #   Voice   $true | $false — Windows TTS announcements (System.Speech)
+        #
         #   Webhook named key from Webhooks below — POST when set (additive)
         #
-        # Override per timer:  t 25m -Visual toast -Sound -Webhook discord-main
-        # Override per preset:  Visual = 'none'; Sound = $true  (see tabata)
+        # Override per timer:  t 25m -Visual toast -Sound -Voice -Webhook discord-main
+        # Override per preset:  Visual = 'none'; Sound = $true; Voice = $true  (see tabata)
         # Legacy shorthand:     t 25m -Notify sound  (maps to Visual/Sound)
         #
-        # Priority: -Notify > -Visual/-Sound/-Webhook > preset > TimerDefaults
+        # Priority: -Notify > -Visual/-Sound/-Voice/-Webhook > preset > TimerDefaults
         Visual  = 'none'
         Sound   = $true
+        Voice   = $false
         Webhook = $null
+
+        # Voice — Windows TTS (System.Speech.Synthesis.SpeechSynthesizer)
+        VoiceRate   = 0      # -10 .. 10
+        VoiceName   = $null  # $null = system default; list: Get-TimerInstalledVoices
+        VoiceVolume = 100    # 0 .. 100
+        Countdown   = 'none' # none | 321 | 10 | both — mid-phase spoken countdown
 
         # SoundFile — name from Sounds below, raw .wav path, or $null (built-in beep)
         SoundFile = $null
@@ -145,6 +154,52 @@ $global:Config = @{
         'win-critical'    = (Join-Path $env:windir 'Media\Windows Critical Stop.wav')
     }
 
+    # VoiceTemplates — spoken announcement patterns (tokens: {label}, {next}, {round}, {set}, {exercise}, {seconds}, {routine}, {phaseCount})
+    VoiceTemplates = @{
+        PhaseStart      = '{label}'
+        PhaseEnd        = '{next}'
+        WorkoutStart    = 'Starting {description}. {duration}, {phaseCount} phases. Ends at {endTime}.'
+        WorkoutComplete = 'Workout complete. Well done.'
+        CountdownTick   = '{seconds}'
+        CountdownGo     = 'Go'
+        RoundComplete   = 'Round {round} complete'
+    }
+
+    # Workouts — structured routines (t workout, twko)
+    Workouts = @{
+        'upper-push' = @{
+            Description      = 'Push day: bench, OHP, triceps'
+            Warmup           = '5m warmup'
+            Cooldown         = '3m cooldown'
+            Voice            = $true
+            Visual           = 'none'
+            Sound            = $false
+            Countdown        = '321'
+            BetweenExercises = '60s'
+            Exercises        = @(
+                @{ Name = 'Bench press'; Sets = 4; Work = '45s'; Rest = '90s' }
+                @{ Name = 'Overhead press'; Sets = 3; Work = '45s'; Rest = '90s' }
+                @{ Name = 'Tricep pushdown'; Sets = 3; Work = '40s'; Rest = '60s' }
+            )
+        }
+        'tabata-hiit' = @{
+            Description = '4-minute Tabata with voice coaching'
+            Pattern     = '(20s work, 10s rest)x8'
+            Voice       = $true
+            Visual      = 'none'
+            Sound       = $false
+            Countdown   = '321'
+        }
+        'quick-hiit' = @{
+            Description = '10-round 30/30 HIIT'
+            Pattern     = '(30s work, 30s rest)x10'
+            Voice       = $true
+            Visual      = 'none'
+            Sound       = $false
+            Countdown   = '321'
+        }
+    }
+
     # Presets — sequence patterns by name (t pomodoro, tpre)
     Presets = @{
         'pomodoro' = @{
@@ -194,8 +249,10 @@ $global:Config = @{
         'tabata' = @{
             Pattern     = '(20s work, 10s rest)x8'
             Visual      = 'none'
-            Sound       = $true
-            Description = 'Tabata HIIT interval (4 minutes)'
+            Sound       = $false
+            Voice       = $true
+            Countdown   = '321'
+            Description = 'Tabata HIIT interval with voice coaching (4 minutes)'
         }
         'cooking-pasta' = @{
             Pattern     = '10m boil, 2m rest'
@@ -211,7 +268,11 @@ $global:Config = @{
         }
         'gym-sets' = @{
             Pattern     = '(3m set, 90s rest)x5'
-            Description = 'Weight training sets with rest'
+            Voice       = $true
+            Visual      = 'none'
+            Sound       = $false
+            Countdown   = '10'
+            Description = 'Weight training sets with voice rest cues'
         }
         'two-minute' = @{
             Pattern     = "2m 'quick task'"
@@ -224,6 +285,30 @@ $global:Config = @{
         'ultradian' = @{
             Pattern     = '(90m focus, 20m break)x2'
             Description = 'Natural ultradian work cycles'
+        }
+        'hiit-30-30' = @{
+            Pattern     = '(30s work, 30s rest)x10'
+            Voice       = $true
+            Visual      = 'none'
+            Sound       = $false
+            Countdown   = '321'
+            Description = '30/30 HIIT intervals with voice'
+        }
+        'emom-12' = @{
+            Pattern     = "(1m work)x12"
+            Voice       = $true
+            Visual      = 'none'
+            Sound       = $false
+            Countdown   = '10'
+            Description = 'Every minute on the minute — 12 rounds'
+        }
+        'amrap-20' = @{
+            Pattern     = "20m 'amrap'"
+            Voice       = $true
+            Visual      = 'none'
+            Sound       = $false
+            Countdown   = 'none'
+            Description = '20-minute AMRAP with start/end voice'
         }
     }
 }

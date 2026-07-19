@@ -1,18 +1,19 @@
 # Notifications
 
-When a timer phase completes, PS1Timer can notify you through three **independent** channels:
+When a timer phase completes, PS1Timer can notify you through **four** independent channels:
 
 | Channel | Config key | Values | Behavior |
 |---------|------------|--------|----------|
 | Visual | `Visual` | `popup` \| `toast` \| `none` | Modal dialog, tray balloon, or no UI |
 | Sound | `Sound` | `$true` \| `$false` | Console beep or named/raw `SoundFile` when on |
+| Voice | `Voice` | `$true` \| `$false` | Windows TTS (`System.Speech`) — see [voice.md](voice.md) |
 | Webhook | `Webhook` | named key or `$null` | POST JSON when defined (additive) |
 
 Example combinations:
 
-- `Visual='toast', Sound=$true, Webhook='discord-main'` → toast + beep + Discord POST
-- `Visual='none', Sound=$true` → sound only (Tabata-style)
-- `Visual='none', Sound=$false` → silent (timer still advances)
+- `Visual='none', Sound=$true, Webhook='discord-main'` → beep + Discord POST
+- `Visual='none', Voice=$true, Countdown='321'` → voice coaching (Tabata-style)
+- `Visual='none', Sound=$false, Voice=$false` → silent (timer still advances)
 
 ## Default configuration
 
@@ -21,6 +22,8 @@ $global:Config = @{
     TimerDefaults = @{
         Visual    = 'none'
         Sound     = $true
+        Voice     = $false
+        Countdown = 'none'
         Webhook   = 'discord-main'   # optional; fires when set
         SoundFile = 'notify'         # name from Sounds ($null = console beep)
         AfterStart = 'none'

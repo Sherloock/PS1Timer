@@ -418,10 +418,12 @@ function Resolve-TimerPaletteColors {
 }
 
 $script:PS1TimerModuleConfig = @{
-    TimerDefaults = @{}
-    Webhooks      = @{}
-    Sounds        = @{}
-    Palettes      = $null
+    TimerDefaults   = @{}
+    Webhooks        = @{}
+    Sounds          = @{}
+    Palettes        = $null
+    VoiceTemplates  = $null
+    Workouts        = $null
 }
 
 function Initialize-PS1TimerModuleConfig {
@@ -430,10 +432,12 @@ function Initialize-PS1TimerModuleConfig {
         Snapshots timer config at module import so other toolkits cannot overwrite Webhooks via $global:Config.
     #>
     $script:PS1TimerModuleConfig = @{
-        TimerDefaults = @{}
-        Webhooks      = @{}
-        Sounds        = @{}
-        Palettes      = $null
+        TimerDefaults  = @{}
+        Webhooks       = @{}
+        Sounds         = @{}
+        Palettes       = $null
+        VoiceTemplates = $null
+        Workouts       = $null
     }
 
     if (-not $global:Config) { return }
@@ -455,6 +459,12 @@ function Initialize-PS1TimerModuleConfig {
     }
     if ($global:Config.Palettes) {
         $script:PS1TimerModuleConfig.Palettes = $global:Config.Palettes
+    }
+    if ($global:Config.VoiceTemplates) {
+        $script:PS1TimerModuleConfig.VoiceTemplates = $global:Config.VoiceTemplates
+    }
+    if ($global:Config.Workouts) {
+        $script:PS1TimerModuleConfig.Workouts = $global:Config.Workouts
     }
 }
 
@@ -498,6 +508,26 @@ function Get-PS1TimerModulePalettes {
     return $null
 }
 
+function Get-PS1TimerModuleVoiceTemplates {
+    if ($script:PS1TimerModuleConfig.VoiceTemplates) {
+        return $script:PS1TimerModuleConfig.VoiceTemplates
+    }
+    if ($global:Config -and $global:Config.VoiceTemplates) {
+        return $global:Config.VoiceTemplates
+    }
+    return Get-DefaultTimerVoiceTemplates
+}
+
+function Get-PS1TimerModuleWorkouts {
+    if ($script:PS1TimerModuleConfig.Workouts) {
+        return $script:PS1TimerModuleConfig.Workouts
+    }
+    if ($global:Config -and $global:Config.Workouts) {
+        return $global:Config.Workouts
+    }
+    return @{}
+}
+
 function ConvertFrom-LegacyNotifyMode {
     <#
     .SYNOPSIS
@@ -514,51 +544,113 @@ function ConvertFrom-LegacyNotifyMode {
     }
 }
 
+function Get-TimerModuleNotifyFallback {
+    <#
+    .SYNOPSIS
+        Reads module TimerDefaults notify channels without calling Get-TimerNotificationConfig.
+    #>
+    $config = Get-PS1TimerModuleTimerDefaults
+    if (-not $config -or $config.Count -eq 0) {
+        return @{ Visual = 'popup'; Sound = $true; Voice = $false }
+    }
+
+    $hasVisual = $config.ContainsKey('Visual') -and -not [string]::IsNullOrWhiteSpace([string]$config.Visual)
+    $hasSound = $config.ContainsKey('Sound')
+    $hasVoice = $config.ContainsKey('Voice')
+
+    if ($hasVisual -or $hasSound -or $hasVoice) {
+        return @{
+            Visual = if ($hasVisual) { "$($config.Visual)".ToLower() } else { 'popup' }
+            Sound  = if ($hasSound) { [bool]$config.Sound } else { $true }
+            Voice  = if ($hasVoice) { [bool]$config.Voice } else { $false }
+        }
+    }
+
+    if ($config.Notify) {
+        $legacy = ConvertFrom-LegacyNotifyMode -Notify $config.Notify
+        return @{ Visual = $legacy.Visual; Sound = $legacy.Sound; Voice = $false }
+    }
+
+    return @{ Visual = 'popup'; Sound = $true; Voice = $false }
+}
+
 function Get-TimerNotifyChannelsFromSource {
     <#
     .SYNOPSIS
-        Reads Visual/Sound from a config or preset hashtable, with legacy Notify fallback.
+        Reads Visual/Sound/Voice from a config or preset hashtable, with legacy Notify fallback.
     #>
     param([hashtable]$Source)
 
+    $defaults = Get-TimerModuleNotifyFallback
+
     if (-not $Source) {
-        return @{ Visual = 'popup'; Sound = $true }
+        return $defaults
     }
 
     $hasVisual = $Source.ContainsKey('Visual') -and -not [string]::IsNullOrWhiteSpace([string]$Source.Visual)
     $hasSound = $Source.ContainsKey('Sound')
+    $hasVoice = $Source.ContainsKey('Voice')
 
-    if ($hasVisual -or $hasSound) {
-        $visual = if ($hasVisual) { "$($Source.Visual)".ToLower() } else { 'popup' }
-        $sound = if ($hasSound) { [bool]$Source.Sound } else { $true }
-        return @{ Visual = $visual; Sound = $sound }
+    if ($hasVisual -or $hasSound -or $hasVoice) {
+        $visual = if ($hasVisual) { "$($Source.Visual)".ToLower() } else { $defaults.Visual }
+        $sound = if ($hasSound) { [bool]$Source.Sound } else { $defaults.Sound }
+        $voice = if ($hasVoice) { [bool]$Source.Voice } else { $defaults.Voice }
+        return @{ Visual = $visual; Sound = $sound; Voice = $voice }
     }
 
     if ($Source.Notify) {
-        return ConvertFrom-LegacyNotifyMode -Notify $Source.Notify
+        $legacy = ConvertFrom-LegacyNotifyMode -Notify $Source.Notify
+        return @{ Visual = $legacy.Visual; Sound = $legacy.Sound; Voice = $false }
     }
 
-    return @{ Visual = 'popup'; Sound = $true }
+    return $defaults
 }
 
 function Get-TimerNotifyChannelsFromTimer {
     <#
     .SYNOPSIS
-        Resolves Visual/Sound from a timer object (new fields or legacy NotifyType).
+        Resolves Visual/Sound/Voice from a timer object (new fields or legacy NotifyType).
     #>
     param([PSCustomObject]$Timer)
 
+    $defaults = Get-TimerModuleNotifyFallback
+
     if ($Timer.PSObject.Properties.Name -contains 'NotifyVisual') {
-        $visual = if ($Timer.NotifyVisual) { "$($Timer.NotifyVisual)".ToLower() } else { 'popup' }
-        $sound = if ($Timer.PSObject.Properties.Name -contains 'NotifySound') { [bool]$Timer.NotifySound } else { $true }
-        return @{ Visual = $visual; Sound = $sound }
+        $visual = if (-not [string]::IsNullOrWhiteSpace([string]$Timer.NotifyVisual)) {
+            "$($Timer.NotifyVisual)".ToLower()
+        } else {
+            $defaults.Visual
+        }
+        $sound = if ($Timer.PSObject.Properties.Name -contains 'NotifySound') { [bool]$Timer.NotifySound } else { $defaults.Sound }
+        $voice = if ($Timer.PSObject.Properties.Name -contains 'NotifyVoice') { [bool]$Timer.NotifyVoice } else { $defaults.Voice }
+        return @{ Visual = $visual; Sound = $sound; Voice = $voice }
     }
 
     if ($Timer.PSObject.Properties.Name -contains 'NotifyType' -and $Timer.NotifyType) {
-        return ConvertFrom-LegacyNotifyMode -Notify $Timer.NotifyType
+        $legacy = ConvertFrom-LegacyNotifyMode -Notify $Timer.NotifyType
+        return @{ Visual = $legacy.Visual; Sound = $legacy.Sound; Voice = $false }
     }
 
-    return @{ Visual = 'popup'; Sound = $true }
+    return $defaults
+}
+
+function Get-TimerFireScriptPreserveNotifyFieldsBlock {
+    <#
+    .SYNOPSIS
+        PowerShell snippet embedded in simple repeat fire scripts to keep notify settings in JSON.
+        Inserted via $(...) into the fire-script here-string; do not backtick-escape variables here.
+    #>
+    return @'
+                $notifyProps = @('NotifyVisual', 'NotifySound', 'NotifyVoice', 'NotifyType', 'WebhookName', 'VoiceName', 'VoiceRate', 'VoiceVolume', 'CountdownMode')
+                foreach ($np in $notifyProps) {
+                    if ($timer.PSObject.Properties.Name -contains $np -and $null -ne $timer.$np) {
+                        $updatedTimer | Add-Member -NotePropertyName $np -NotePropertyValue $timer.$np -Force
+                    }
+                }
+                if ($timer.PSObject.Properties.Name -contains 'BeepAt' -and $timer.BeepAt) {
+                    $updatedTimer | Add-Member -NotePropertyName 'BeepAt' -NotePropertyValue @($timer.BeepAt) -Force
+                }
+'@
 }
 
 function Format-TimerNotifyLabel {
@@ -569,15 +661,80 @@ function Format-TimerNotifyLabel {
     param(
         [string]$Visual,
         [bool]$Sound,
-        [string]$WebhookName = $null
+        [string]$WebhookName = $null,
+        [bool]$Voice = $false,
+        [string]$CountdownMode = $null,
+        [array]$BeepAt = $null
     )
 
     $parts = @()
     if ($Visual -and $Visual -ne 'none') { $parts += $Visual }
     if ($Sound) { $parts += 'sound' }
+    if ($Voice) { $parts += 'voice' }
     if (-not [string]::IsNullOrWhiteSpace($WebhookName)) { $parts += "webhook ($WebhookName)" }
+    if ($CountdownMode -and $CountdownMode -ne 'none') { $parts += "countdown ($CountdownMode)" }
+    if ($BeepAt -and @($BeepAt).Count -gt 0) {
+        $parts += "beep at $(@($BeepAt) -join ',')"
+    }
     if ($parts.Count -eq 0) { return 'silent' }
     return ($parts -join ' + ')
+}
+
+function Parse-BeepAtList {
+    <#
+    .SYNOPSIS
+        Parses -BeepAt values into seconds-before-end offsets (descending, unique).
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][AllowNull()]$InputObject
+    )
+
+    if ($null -eq $InputObject) { return @() }
+
+    $items = [System.Collections.Generic.List[string]]::new()
+    if ($InputObject -is [string]) {
+        foreach ($part in ($InputObject -split ',')) {
+            $trimmed = $part.Trim()
+            if ($trimmed) { [void]$items.Add($trimmed) }
+        }
+    }
+    elseif ($InputObject -is [array]) {
+        foreach ($part in $InputObject) {
+            $trimmed = [string]$part
+            if ($trimmed) { [void]$items.Add($trimmed) }
+        }
+    }
+    else {
+        $trimmed = [string]$InputObject
+        if ($trimmed) { [void]$items.Add($trimmed) }
+    }
+
+    $seconds = [System.Collections.Generic.List[int]]::new()
+    foreach ($item in $items) {
+        $value = ConvertTo-Seconds -Time $item
+        if ($value -gt 0) {
+            [void]$seconds.Add([int]$value)
+        }
+    }
+
+    return @($seconds | Sort-Object -Descending -Unique)
+}
+
+function Test-PS1TimerTestMode {
+    <#
+    .SYNOPSIS
+        True when Pester or automation runs PS1Timer tests (suppresses UI/TTS/watch).
+    #>
+    return [bool]$script:PS1TimerTestMode -or $env:PS1TIMER_TEST -eq '1'
+}
+
+function Get-TimerTestScriptGuard {
+    <#
+    .SYNOPSIS
+        Prepended to generated fire/cue scripts during tests so accidental task runs exit silently.
+    #>
+    if (-not (Test-PS1TimerTestMode)) { return '' }
+    return "exit  # PS1Timer: test-mode fire script`r`n"
 }
 
 function Assert-TimerConfig {
@@ -636,6 +793,25 @@ function Assert-TimerConfig {
             elseif (-not (Test-Path -LiteralPath $resolvedSound)) {
                 Write-Warning "PS1Timer: SoundFile resolved path not found: $resolvedSound"
             }
+        }
+
+        if ($td.VoiceRate -ne $null) {
+            $rate = [int]$td.VoiceRate
+            if ($rate -lt -10 -or $rate -gt 10) {
+                Write-Warning "PS1Timer: TimerDefaults.VoiceRate must be between -10 and 10."
+            }
+        }
+
+        if ($td.VoiceVolume -ne $null) {
+            $vol = [int]$td.VoiceVolume
+            if ($vol -lt 0 -or $vol -gt 100) {
+                Write-Warning "PS1Timer: TimerDefaults.VoiceVolume must be between 0 and 100."
+            }
+        }
+
+        $validCountdown = @('none', '321', '10', 'both')
+        if ($td.Countdown -and ($validCountdown -notcontains $td.Countdown.ToLower())) {
+            Write-Warning "PS1Timer: TimerDefaults.Countdown '$($td.Countdown)' is invalid. Use: $($validCountdown -join ', ')"
         }
     }
 
@@ -697,6 +873,24 @@ function Assert-TimerConfig {
             if ($preset.Webhook -and -not (Resolve-TimerWebhookUrl -Name $preset.Webhook)) {
                 Write-Warning "PS1Timer: Presets['$presetName'].Webhook '$($preset.Webhook)' not found in Config.Webhooks."
             }
+            if ($preset.Countdown) {
+                $validCountdown = @('none', '321', '10', 'both')
+                if ($validCountdown -notcontains $preset.Countdown.ToLower()) {
+                    Write-Warning "PS1Timer: Presets['$presetName'].Countdown '$($preset.Countdown)' is invalid."
+                }
+            }
+        }
+    }
+
+    if ($global:Config.Workouts) {
+        foreach ($workoutName in $global:Config.Workouts.Keys) {
+            $workout = $global:Config.Workouts[$workoutName]
+            if ($workout.Countdown) {
+                $validCountdown = @('none', '321', '10', 'both')
+                if ($validCountdown -notcontains $workout.Countdown.ToLower()) {
+                    Write-Warning "PS1Timer: Workouts['$workoutName'].Countdown '$($workout.Countdown)' is invalid."
+                }
+            }
         }
     }
 }
@@ -737,6 +931,287 @@ function Resolve-TimerSoundFilePath {
     }
 
     return $null
+}
+
+function Get-DefaultTimerVoiceTemplates {
+    return @{
+        PhaseStart      = '{label}'
+        PhaseEnd        = '{next}'
+        WorkoutStart    = 'Starting {description}. {duration}, {phaseCount} phases. Ends at {endTime}.'
+        WorkoutComplete = 'Workout complete. Well done.'
+        CountdownTick   = '{seconds}'
+        CountdownGo     = 'Go'
+        RoundComplete   = 'Round {round} complete'
+    }
+}
+
+function Get-TimerVoiceConfig {
+    $defaults = Get-PS1TimerModuleTimerDefaults
+    return @{
+        Voice       = if ($defaults.ContainsKey('Voice')) { [bool]$defaults.Voice } else { $false }
+        VoiceRate   = if ($defaults.VoiceRate -ne $null) { [int]$defaults.VoiceRate } else { 0 }
+        VoiceName   = if ($defaults.VoiceName) { [string]$defaults.VoiceName } else { $null }
+        VoiceVolume = if ($defaults.VoiceVolume -ne $null) { [int]$defaults.VoiceVolume } else { 100 }
+        Countdown   = if ($defaults.Countdown) { [string]$defaults.Countdown } else { 'none' }
+    }
+}
+
+function Get-TimerInstalledVoices {
+    try {
+        Add-Type -AssemblyName System.Speech
+        $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
+        $voices = @($synth.GetInstalledVoices() | ForEach-Object { $_.VoiceInfo.Name })
+        $synth.Dispose()
+        return $voices
+    }
+    catch {
+        Write-Warning "PS1Timer: Could not list installed voices: $($_.Exception.Message)"
+        return @()
+    }
+}
+
+function Resolve-TimerSpeechText {
+    <#
+    .SYNOPSIS
+        Applies voice templates and token substitution for spoken announcements.
+    #>
+    param(
+        [ValidateSet('PhaseStart', 'PhaseEnd', 'WorkoutStart', 'WorkoutComplete', 'CountdownTick', 'CountdownGo', 'RoundComplete')]
+        [string]$TemplateKey,
+        [hashtable]$Tokens = @{}
+    )
+
+    $templates = Get-PS1TimerModuleVoiceTemplates
+    $template = if ($templates -and $templates.ContainsKey($TemplateKey)) {
+        [string]$templates[$TemplateKey]
+    }
+    else {
+        (Get-DefaultTimerVoiceTemplates)[$TemplateKey]
+    }
+
+    if ([string]::IsNullOrWhiteSpace($template)) { return '' }
+
+    $result = $template
+    foreach ($key in $Tokens.Keys) {
+        $value = if ($null -eq $Tokens[$key]) { '' } else { [string]$Tokens[$key] }
+        $result = $result -replace [regex]::Escape("{$key}"), $value
+    }
+    $result = $result -replace '\{[a-zA-Z]+\}', ''
+    return $result.Trim()
+}
+
+function Get-TimerPhaseCueSchedule {
+    <#
+    .SYNOPSIS
+        Builds phase cue offsets (seconds before phase end) for voice and beep cues.
+    #>
+    param(
+        [Parameter(Mandatory)][int]$PhaseSeconds,
+        [ValidateSet('none', '321', '10', 'both')]
+        [string]$CountdownMode = 'none',
+        [string]$PhaseStartText = $null,
+        [switch]$IncludePhaseStartAtZero,
+        [int[]]$BeepAtSeconds = @(),
+        [switch]$IncludeEndBeep321
+    )
+
+    $cues = [System.Collections.Generic.List[object]]::new()
+    $beepOffsets = [System.Collections.Generic.HashSet[int]]::new()
+
+    if ($PhaseSeconds -le 0) {
+        return @()
+    }
+
+    if ($IncludePhaseStartAtZero -and -not [string]::IsNullOrWhiteSpace($PhaseStartText)) {
+        $cues.Add([PSCustomObject]@{
+            OffsetFromEnd = $PhaseSeconds
+            Text          = $PhaseStartText
+            CueType       = 'start'
+        })
+    }
+
+    if ($CountdownMode -ne 'none') {
+        $modes = if ($CountdownMode -eq 'both') { @('10', '321') } else { @($CountdownMode) }
+        foreach ($mode in $modes) {
+            if ($mode -eq '10' -and $PhaseSeconds -ge 10) {
+                $cues.Add([PSCustomObject]@{
+                    OffsetFromEnd = 10
+                    Text          = Resolve-TimerSpeechText -TemplateKey 'CountdownTick' -Tokens @{ seconds = '10' }
+                    CueType       = 'countdown'
+                })
+            }
+            if ($mode -eq '321') {
+                $maxTick = [Math]::Min(3, $PhaseSeconds)
+                for ($i = $maxTick; $i -ge 1; $i--) {
+                    $cues.Add([PSCustomObject]@{
+                        OffsetFromEnd = $i
+                        Text          = Resolve-TimerSpeechText -TemplateKey 'CountdownTick' -Tokens @{ seconds = [string]$i }
+                        CueType       = 'countdown'
+                    })
+                }
+            }
+        }
+    }
+
+    foreach ($offset in @($BeepAtSeconds)) {
+        if ($offset -gt 0 -and $offset -le $PhaseSeconds) {
+            [void]$beepOffsets.Add([int]$offset)
+        }
+    }
+
+    if ($IncludeEndBeep321) {
+        $maxTick = [Math]::Min(3, $PhaseSeconds)
+        for ($i = $maxTick; $i -ge 1; $i--) {
+            [void]$beepOffsets.Add($i)
+        }
+    }
+
+    foreach ($offset in ($beepOffsets | Sort-Object -Descending)) {
+        $cues.Add([PSCustomObject]@{
+            OffsetFromEnd = $offset
+            Text          = $null
+            CueType       = 'beep'
+        })
+    }
+
+    return @($cues | Sort-Object -Property OffsetFromEnd -Descending)
+}
+
+function ConvertFrom-WorkoutRoutine {
+    <#
+    .SYNOPSIS
+        Expands a named workout routine into flat sequence phases with coaching metadata.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$RoutineName,
+        [string]$CountdownMode = $null
+    )
+
+    $workouts = Get-PS1TimerModuleWorkouts
+    if (-not $workouts -or -not $workouts.ContainsKey($RoutineName)) {
+        throw "Workout routine '$RoutineName' not found in Config.Workouts."
+    }
+
+    $routine = $workouts[$RoutineName]
+    $countdown = if ($CountdownMode) { $CountdownMode } elseif ($routine.Countdown) { [string]$routine.Countdown } else { (Get-TimerVoiceConfig).Countdown }
+
+    if ($routine.Pattern) {
+        $phases = @(ConvertFrom-TimerSequence -Pattern $routine.Pattern)
+        foreach ($p in $phases) {
+            $p | Add-Member -NotePropertyName 'Countdown' -NotePropertyValue $countdown -Force
+            if (-not $p.AnnounceStart) {
+                $p | Add-Member -NotePropertyName 'AnnounceStart' -NotePropertyValue $p.Label -Force
+            }
+        }
+        return $phases
+    }
+
+    $phases = [System.Collections.Generic.List[object]]::new()
+
+    if ($routine.Warmup) {
+        $warmupPhases = @(ConvertFrom-TimerSequence -Pattern $routine.Warmup)
+        foreach ($p in $warmupPhases) {
+            $p | Add-Member -NotePropertyName 'PhaseType' -NotePropertyValue 'warmup' -Force
+            $p | Add-Member -NotePropertyName 'Countdown' -NotePropertyValue 'none' -Force
+            $p | Add-Member -NotePropertyName 'AnnounceStart' -NotePropertyValue $p.Label -Force
+            $phases.Add($p)
+        }
+    }
+
+    $exercises = @($routine.Exercises)
+    for ($exIdx = 0; $exIdx -lt $exercises.Count; $exIdx++) {
+        $ex = $exercises[$exIdx]
+        $name = [string]$ex.Name
+        $sets = if ($ex.Sets) { [int]$ex.Sets } else { 1 }
+        $workDur = if ($ex.Work) { [string]$ex.Work } else { '45s' }
+        $restDur = if ($ex.Rest) { [string]$ex.Rest } else { '60s' }
+        $workSeconds = ConvertTo-Seconds -Time $workDur
+        $restSeconds = ConvertTo-Seconds -Time $restDur
+
+        for ($setNum = 1; $setNum -le $sets; $setNum++) {
+            $workLabel = if ($sets -gt 1) { "$name, set $setNum" } else { $name }
+            $phases.Add([PSCustomObject]@{
+                Seconds       = $workSeconds
+                Label         = $workLabel
+                Duration      = $workDur
+                LoopId        = "ex$($exIdx + 1)"
+                LoopIteration = $setNum
+                LoopTotal     = $sets
+                PhaseType     = 'work'
+                ExerciseName  = $name
+                SetNumber     = $setNum
+                SetTotal      = $sets
+                Countdown     = $countdown
+                AnnounceStart = $workLabel
+                AnnounceEnd   = 'Rest'
+            })
+            if ($setNum -lt $sets -or $exIdx -lt ($exercises.Count - 1)) {
+                $phases.Add([PSCustomObject]@{
+                    Seconds       = $restSeconds
+                    Label         = 'rest'
+                    Duration      = $restDur
+                    LoopId        = "ex$($exIdx + 1)"
+                    LoopIteration = $setNum
+                    LoopTotal     = $sets
+                    PhaseType     = 'rest'
+                    ExerciseName  = $name
+                    SetNumber     = $setNum
+                    SetTotal      = $sets
+                    Countdown     = 'none'
+                    AnnounceStart = 'Rest'
+                    AnnounceEnd   = if ($setNum -lt $sets) { "$name, set $($setNum + 1)" } else { $name }
+                })
+            }
+        }
+
+        if ($routine.BetweenExercises -and $exIdx -lt ($exercises.Count - 1)) {
+            $betweenSeconds = ConvertTo-Seconds -Time $routine.BetweenExercises
+            if ($betweenSeconds -gt 0) {
+                $phases.Add([PSCustomObject]@{
+                    Seconds       = $betweenSeconds
+                    Label         = 'transition'
+                    Duration      = $routine.BetweenExercises
+                    LoopId        = ''
+                    LoopIteration = 1
+                    LoopTotal     = 1
+                    PhaseType     = 'transition'
+                    Countdown     = 'none'
+                    AnnounceStart = 'Next exercise'
+                    AnnounceEnd   = $exercises[$exIdx + 1].Name
+                })
+            }
+        }
+    }
+
+    if ($routine.Cooldown) {
+        $cooldownPhases = @(ConvertFrom-TimerSequence -Pattern $routine.Cooldown)
+        foreach ($p in $cooldownPhases) {
+            $p | Add-Member -NotePropertyName 'PhaseType' -NotePropertyValue 'cooldown' -Force
+            $p | Add-Member -NotePropertyName 'Countdown' -NotePropertyValue 'none' -Force
+            $p | Add-Member -NotePropertyName 'AnnounceStart' -NotePropertyValue $p.Label -Force
+            $phases.Add($p)
+        }
+    }
+
+    return @($phases)
+}
+
+function Get-WorkoutPickerOptions {
+    $workouts = Get-PS1TimerModuleWorkouts
+    if (-not $workouts -or $workouts.Count -eq 0) { return @() }
+
+    $options = @()
+    foreach ($key in ($workouts.Keys | Sort-Object)) {
+        $w = $workouts[$key]
+        $desc = if ($w.Description) { [string]$w.Description } else { $key }
+        $options += @{
+            Id          = $key
+            Label       = $key
+            Description = $desc
+            Color       = 'Cyan'
+        }
+    }
+    return $options
 }
 
 function Parse-TimerAtTime {

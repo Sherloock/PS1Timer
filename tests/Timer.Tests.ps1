@@ -3,24 +3,7 @@
 
 BeforeAll {
     $ModuleRoot = Split-Path -Parent $PSScriptRoot
-    if (-not $global:Config) { $global:Config = @{} }
-    $exampleConfig = Join-Path $ModuleRoot 'config.example.ps1'
-    if (Test-Path -LiteralPath $exampleConfig) {
-        . $exampleConfig
-    }
-    . "$ModuleRoot\src\TimerHelpers.ps1"
-    . "$ModuleRoot\src\Timer.ps1"
-
-    $script:TimerDataFile = "$TestDrive\ps-timers.json"
-    $script:TimerHistoryFile = "$TestDrive\ps-timer-history.json"
-    $script:TimerForceSyncRegister = $true
-
-    function Reset-TimerDataCacheForTests {
-        $script:TimerDataCache = $null
-        $script:TimerDataCacheTime = [DateTime]::MinValue
-        $script:TimerTaskNameCache = $null
-        $script:TimerTaskNameCacheTime = [DateTime]::MinValue
-    }
+    . "$PSScriptRoot\PS1Timer.TestBootstrap.ps1" -ModuleRoot $ModuleRoot -TestDrive $TestDrive
 }
 
 # ============================================================================
@@ -29,8 +12,6 @@ BeforeAll {
 
 Describe "Timer" {
     BeforeAll {
-        # Mock scheduled task functions
-        Mock Register-ScheduledTask { }
         Mock Remove-TimerScheduledTaskByName { }
         Mock Set-Content { } -ParameterFilter { $LiteralPath -like "*PSTimer_*.ps1" }
     }
@@ -385,6 +366,13 @@ Describe "TimerResume" {
             $content | Should -Match 'if \(-not \$timer\.IsSequence\) \{ exit \}'
             $content | Should -Match '\$nextPhaseIdx'
             $content | Should -Not -Match '\$repeatRemaining -gt 0'
+            $transitionPos = $content.IndexOf('$nextTaskName = "PSTimer_${timerId}_')
+            $voicePos = $content.IndexOf('System.Speech.Synthesis.SpeechSynthesizer')
+            if ($voicePos -lt 0) { $voicePos = $content.IndexOf('Add-Type -AssemblyName System.Speech') }
+            $transitionPos | Should -BeGreaterThan 0
+            if ($voicePos -ge 0) {
+                $transitionPos | Should -BeLessThan $voicePos
+            }
         }
         finally {
             if (Test-Path -LiteralPath $scriptPath) { Remove-Item -LiteralPath $scriptPath -Force }
@@ -529,23 +517,22 @@ Describe "TimerRemove" {
 # ============================================================================
 
 Describe "Sync-TimerData" {
-    BeforeAll {
-        Mock Get-PSTimerScheduledTaskNames { [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase) }
-    }
-
     BeforeEach {
         Reset-TimerDataCacheForTests
         if (Test-Path $script:TimerDataFile) { Remove-Item $script:TimerDataFile -Force }
     }
 
     It "marks timer as Lost when task missing and time expired" {
+        Set-TimerTestScheduledTaskNamesResultOverride ([System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase))
+
+        $expiredEnd = (Get-Date).AddSeconds(-5).ToString('o')
         $timer = [PSCustomObject]@{
             Id = "1"
             Duration = "5m"
             Seconds = 300
             Message = "Test"
-            StartTime = (Get-Date).AddSeconds(-400).ToString('o')
-            EndTime = (Get-Date).AddSeconds(-100).ToString('o')
+            StartTime = (Get-Date).AddSeconds(-10).ToString('o')
+            EndTime = $expiredEnd
             RepeatTotal = 1
             RepeatRemaining = 0
             CurrentRun = 1
@@ -561,7 +548,7 @@ Describe "Sync-TimerData" {
     It "keeps timer Running when task exists" {
         $existing = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
         [void]$existing.Add('PSTimer_1')
-        Mock Get-PSTimerScheduledTaskNames { return $existing }
+        Set-TimerTestScheduledTaskNamesResultOverride $existing
 
         $timer = [PSCustomObject]@{
             Id = "1"
@@ -569,7 +556,7 @@ Describe "Sync-TimerData" {
             Seconds = 300
             Message = "Test"
             StartTime = (Get-Date).ToString('o')
-            EndTime = (Get-Date).AddSeconds(300).ToString('o')
+            EndTime = (Get-Date).AddSeconds(1).ToString('o')
             RepeatTotal = 1
             RepeatRemaining = 0
             CurrentRun = 1
@@ -601,6 +588,194 @@ Describe "Sync-TimerData" {
         $result = Sync-TimerData
 
         $result[0].State | Should -Be "Paused"
+    }
+
+    It "does not mark sequence timer Lost while awaiting next phase transition" {
+        Set-TimerTestScheduledTaskNamesResultOverride ([System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase))
+
+        $phases = @(
+            @{ Seconds = 10; Label = 'a'; Duration = '10s' }
+            @{ Seconds = 10; Label = 'b'; Duration = '10s' }
+            @{ Seconds = 10; Label = 'c'; Duration = '10s' }
+            @{ Seconds = 10; Label = 'd'; Duration = '10s' }
+        )
+        $timer = [PSCustomObject]@{
+            Id = 'seq-grace'
+            Duration = '40s'
+            Seconds = 10
+            Message = 'c'
+            StartTime = (Get-Date).AddSeconds(-15).ToString('o')
+            EndTime = (Get-Date).AddSeconds(-3).ToString('o')
+            RepeatTotal = 1
+            RepeatRemaining = 0
+            CurrentRun = 1
+            State = 'Running'
+            IsSequence = $true
+            Phases = $phases
+            CurrentPhase = 2
+            TotalPhases = 4
+            PhaseLabel = 'c'
+            TotalSeconds = 40
+        }
+        Save-TimerData -Timers @($timer)
+
+        $result = Sync-TimerData
+
+        $result[0].State | Should -Be 'Running'
+    }
+
+    It "does not mark timer as Lost when scheduled-task lookup fails" {
+        Set-TimerTestScheduledTaskNamesResultOverride $null
+
+        $timer = [PSCustomObject]@{
+                Id = "1"
+                Duration = "5m"
+                Seconds = 300
+                Message = "Test"
+                StartTime = (Get-Date).AddSeconds(-5).ToString('o')
+                EndTime = (Get-Date).AddSeconds(-1).ToString('o')
+                RepeatTotal = 1
+                RepeatRemaining = 0
+                CurrentRun = 1
+                State = "Running"
+            }
+            Save-TimerData -Timers @($timer)
+
+        $result = Sync-TimerData
+
+        $result[0].State | Should -Be "Running"
+    }
+
+    It "throttles stale scheduled-task cleanup across rapid Sync-TimerData calls" {
+        Mock Remove-StalePSTimerScheduledTasks { return 0 }
+        $prevForceSync = $script:TimerForceSyncRegister
+        $script:TimerForceSyncRegister = $false
+        $script:TimerStaleCleanupLastRun = [DateTime]::MinValue
+
+        try {
+            Save-TimerData -Timers @()
+            $null = Sync-TimerData
+            $null = Sync-TimerData
+            Assert-MockCalled Remove-StalePSTimerScheduledTasks -Times 1 -Exactly
+        }
+        finally {
+            $script:TimerForceSyncRegister = $prevForceSync
+        }
+    }
+
+    It "re-registers missing scheduled task when phase still has time left" {
+        Set-TimerTestScheduledTaskNamesResultOverride ([System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase))
+        Mock Start-TimerScheduledJob { }
+        Mock Invoke-RegisterTimerResumeCues { }
+
+        $futureEnd = (Get-Date).AddMinutes(30).ToString('o')
+        $timer = [PSCustomObject]@{
+            Id = 'sleep-1'
+            Duration = '45m'
+            Seconds = 2700
+            Message = 'water'
+            StartTime = (Get-Date).ToString('o')
+            EndTime = $futureEnd
+            RepeatTotal = 1
+            RepeatRemaining = 0
+            CurrentRun = 1
+            State = 'Running'
+            IsSequence = $true
+            TaskName = 'PSTimer_sleep-1_abcdef01'
+            CurrentPhase = 0
+            TotalPhases = 3
+            PhaseLabel = 'water'
+            Phases = @(
+                @{ Seconds = 2700; Label = 'water'; Duration = '45m' }
+                @{ Seconds = 2700; Label = 'water'; Duration = '45m' }
+                @{ Seconds = 2700; Label = 'water'; Duration = '45m' }
+            )
+        }
+        Save-TimerData -Timers @($timer)
+
+        $result = Sync-TimerData
+
+        $result[0].State | Should -Be 'Running'
+        Assert-MockCalled Start-TimerScheduledJob -Times 1 -Exactly
+        Assert-MockCalled Invoke-RegisterTimerResumeCues -Times 1 -Exactly
+    }
+
+    It "does not mark long-overdue sequence Lost when recovery advances phase" {
+        Set-TimerTestScheduledTaskNamesResultOverride ([System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase))
+        Mock Repair-TimerScheduledTaskIfMissing { return $true }
+
+        $phases = @(
+            @{ Seconds = 10; Label = 'a'; Duration = '10s' }
+            @{ Seconds = 10; Label = 'b'; Duration = '10s' }
+            @{ Seconds = 10; Label = 'c'; Duration = '10s' }
+        )
+        $timer = [PSCustomObject]@{
+            Id = 'sleep-seq'
+            Duration = '30s'
+            Seconds = 10
+            Message = 'a'
+            StartTime = (Get-Date).AddMinutes(-5).ToString('o')
+            EndTime = (Get-Date).AddSeconds(-15).ToString('o')
+            RepeatTotal = 1
+            RepeatRemaining = 0
+            CurrentRun = 1
+            State = 'Running'
+            IsSequence = $true
+            Phases = $phases
+            CurrentPhase = 0
+            TotalPhases = 3
+            PhaseLabel = 'a'
+            TotalSeconds = 30
+            TaskName = 'PSTimer_sleep-seq_deadbeef'
+        }
+        Save-TimerData -Timers @($timer)
+
+        $result = Sync-TimerData
+
+        $result[0].State | Should -Be 'Running'
+        [int]$result[0].CurrentPhase | Should -Be 1
+    }
+
+    It "Remove-StalePSTimerScheduledTasks skips cleanup when timer read returns empty but file has data" {
+        $utf8 = New-Object System.Text.UTF8Encoding $true
+        [System.IO.File]::WriteAllText($script:TimerDataFile, '[{"Id":"1","State":"Running","TaskName":"PSTimer_1_abc"}]', $utf8)
+
+        $existing = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        [void]$existing.Add('PSTimer_1_abc')
+        [void]$existing.Add('PSTimer_9_orphan')
+        Set-TimerTestScheduledTaskNamesResultOverride $existing
+
+        Mock Get-TimerData { return @() }
+        Mock Remove-TimerScheduledTaskByName { }
+
+        $removed = Remove-StalePSTimerScheduledTasks
+
+        $removed | Should -Be 0
+        Assert-MockCalled Remove-TimerScheduledTaskByName -Times 0 -Exactly
+    }
+
+    It "Remove-StalePSTimerScheduledTasks keeps referenced cue tasks" {
+        $timer = [PSCustomObject]@{
+            Id = 'cue-1'
+            State = 'Running'
+            TaskName = 'PSTimer_cue-1_main01'
+            CueTaskNames = @('PSTimer_cue-1_cue_abcd1234')
+        }
+        Save-TimerData -Timers @($timer)
+
+        $existing = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        [void]$existing.Add('PSTimer_cue-1_main01')
+        [void]$existing.Add('PSTimer_cue-1_cue_abcd1234')
+        [void]$existing.Add('PSTimer_orphan_old')
+        Set-TimerTestScheduledTaskNamesResultOverride $existing
+
+        Mock Remove-TimerScheduledTaskByName { }
+
+        $removed = Remove-StalePSTimerScheduledTasks
+
+        $removed | Should -Be 1
+        Assert-MockCalled Remove-TimerScheduledTaskByName -ParameterFilter { $TaskName -eq 'PSTimer_orphan_old' } -Times 1 -Exactly
+        Assert-MockCalled Remove-TimerScheduledTaskByName -ParameterFilter { $TaskName -eq 'PSTimer_cue-1_cue_abcd1234' } -Times 0 -Exactly
     }
 }
 
@@ -850,6 +1025,92 @@ Describe "Get-TimerWatchPhaseTimelineContent" {
     }
 }
 
+Describe "Timer presets and sequence limits" {
+    BeforeEach {
+        Reset-TimerDataCacheForTests
+        if (Test-Path $script:TimerDataFile) { Remove-Item $script:TimerDataFile -Force }
+    }
+
+    It "starts simple repeating timer from Time/Repeat preset" {
+        $presetKey = 'water-test'
+        $savedPreset = $null
+        if ($script:TimerPresets.ContainsKey($presetKey)) {
+            $savedPreset = $script:TimerPresets[$presetKey]
+        }
+        try {
+            $script:TimerPresets[$presetKey] = @{
+                Time        = '45m'
+                Message     = 'water'
+                Repeat      = 100
+                Description = 'test preset'
+            }
+            Timer -Time $presetKey -NoSound
+            $timers = @(Get-TimerData)
+            $timers.Count | Should -Be 1
+            $timers[0].IsSequence | Should -BeFalse
+            $timers[0].RepeatTotal | Should -Be 100
+            $timers[0].Message | Should -Be 'water'
+            $timers[0].Seconds | Should -Be 2700
+        }
+        finally {
+            if ($null -ne $savedPreset) {
+                $script:TimerPresets[$presetKey] = $savedPreset
+            }
+            else {
+                $script:TimerPresets.Remove($presetKey)
+            }
+        }
+    }
+
+    It "rejects sequence patterns above MaxSequencePhases" {
+        { ConvertFrom-TimerSequence -Pattern '(1s tick)x501' } | Should -Throw '*maximum is 500*'
+    }
+
+    It "Get-TimerFinalEndTime uses uniform fast path for repeating phases" {
+        $phases = @(ConvertFrom-TimerSequence -Pattern '(10s a, 10s b)x2')
+        $timer = [PSCustomObject]@{
+            IsSequence   = $true
+            State        = 'Running'
+            StartTime    = (Get-Date).AddMinutes(-5).ToString('o')
+            EndTime      = (Get-Date).AddMinutes(1).ToString('o')
+            CurrentPhase = 1
+            Phases       = $phases
+            TotalSeconds = 40
+            Seconds      = 10
+        }
+        $result = Get-TimerFinalEndTime -Timer $timer
+        $expected = [DateTime]::Parse($timer.EndTime).AddSeconds(20)
+        $result.ToString('o') | Should -Be $expected.ToString('o')
+    }
+
+    It "Sync-CatchUpUniformSequencePhase advances overdue uniform sequences" {
+        Mock Repair-TimerScheduledTaskIfMissing { return $true }
+        $phases = @()
+        for ($i = 0; $i -lt 10; $i++) {
+            $phases += [PSCustomObject]@{ Seconds = 60; Label = 'water'; Duration = '1m' }
+        }
+        $timer = [PSCustomObject]@{
+            Id           = 'catchup-1'
+            IsSequence   = $true
+            State        = 'Running'
+            StartTime    = (Get-Date).AddHours(-3).ToString('o')
+            EndTime      = (Get-Date).AddHours(-2).ToString('o')
+            CurrentPhase = 0
+            TotalPhases  = 10
+            PhaseLabel   = 'water'
+            Message      = 'water'
+            Seconds      = 60
+            Phases       = $phases
+            TaskName     = 'PSTimer_catchup-1_abc'
+        }
+        $now = Get-Date
+        $changed = Sync-CatchUpUniformSequencePhase -Timer $timer -Now $now
+        $changed | Should -BeTrue
+        [int]$timer.CurrentPhase | Should -BeGreaterThan 0
+        ([DateTime]::Parse($timer.EndTime) -gt $now) | Should -BeTrue
+    }
+}
+
 Describe "Get-SequencePhaseEndTime" {
     It "returns cumulative end times from scheduled start" {
         $now = [DateTime]::new(2024, 6, 1, 12, 0, 0)
@@ -912,10 +1173,17 @@ Describe "Show-TimerWatchDisplay" {
             IsSequence      = $false
         }
 
+        $script:WatchInputCalls = 0
         Mock Get-Date { return $fixedNow }
-        Mock Wait-OneSecondOrKeyPress { return $true }
+        Mock Wait-TimerWatchInput {
+            $script:WatchInputCalls++
+            if ($script:WatchInputCalls -lt 25) { return @{ Action = 'tick' } }
+            return @{ Action = 'exit' }
+        }
+        Mock Sync-TimerData { return @($timerFirstRun) }
         Mock Clear-Host { }
         Mock Get-TimerWatchCompletedContent { return [System.Text.StringBuilder]::new() }
+        Mock Start-Sleep { }
 
         Mock Get-TimerDataIfChanged {
             param([switch]$Force)
@@ -962,7 +1230,8 @@ Describe "Show-TimerWatchDisplay" {
         }
 
         Mock Get-Date { return $fixedNow }
-        Mock Wait-OneSecondOrKeyPress { return $true }
+        Mock Wait-TimerWatchInput { return @{ Action = 'exit' } }
+        Mock Sync-TimerData { return @($runningTimer) }
         Mock Clear-Host { }
         Mock Get-TimerWatchCompletedContent { return [System.Text.StringBuilder]::new() }
         Mock Start-Sleep { }
@@ -1018,7 +1287,8 @@ Describe "Show-TimerWatchDisplay" {
         }
 
         Mock Get-Date { return $fixedNow }
-        Mock Wait-OneSecondOrKeyPress { return $true }
+        Mock Wait-TimerWatchInput { return @{ Action = 'tick' } }
+        Mock Sync-TimerData { return @($timerLastRun) }
         Mock Clear-Host { }
         Mock Get-TimerWatchCompletedContent { return [System.Text.StringBuilder]::new() }
         Mock Start-Sleep { }
@@ -1062,26 +1332,111 @@ Describe "Timer scheduled task helpers" {
         }
     }
 
+    It "Write-TimerVbsLauncherFile writes ASCII without BOM" {
+        $savedPwsh = $script:PS1TimerPwsh
+        try {
+            $script:PS1TimerPwsh = 'C:\Program Files\PowerShell\7\pwsh.exe'
+            $ps1Path = Join-Path $TestDrive 'PSTimer_cue_test.ps1'
+            $vbsPath = Join-Path $TestDrive 'PSTimer_cue_test.vbs'
+            Set-Content -LiteralPath $ps1Path -Value '# test' -Encoding Ascii
+
+            Write-TimerVbsLauncherFile -VbsPath $vbsPath -Ps1Path $ps1Path
+
+            Test-Path -LiteralPath $vbsPath | Should -BeTrue
+            $bytes = [System.IO.File]::ReadAllBytes($vbsPath)
+            $bytes[0..2] | Should -Not -Be @(0xEF, 0xBB, 0xBF)
+            $content = Get-Content -LiteralPath $vbsPath -Raw
+            $content | Should -Match 'Chr\(34\)'
+            $content | Should -Match 'PSTimer_cue_test\.ps1'
+        }
+        finally {
+            $script:PS1TimerPwsh = $savedPwsh
+        }
+    }
+
+    It "Register-TimerCueTask writes ASCII cue VBS launcher" {
+        $savedPwsh = $script:PS1TimerPwsh
+        try {
+            $script:PS1TimerPwsh = 'C:\Program Files\PowerShell\7\pwsh.exe'
+            Mock Register-TimerScheduledTask { return $true }
+
+            $cueName = 'PSTimer_99_cue_testabcd'
+            $ps1Path = Join-Path $env:TEMP "$cueName.ps1"
+            $vbsPath = Join-Path $env:TEMP "$cueName.vbs"
+            Set-Content -LiteralPath $ps1Path -Value '# cue' -Encoding Ascii
+
+            Register-TimerCueTask -CueTaskName $cueName -TriggerTime (Get-Date).AddMinutes(5) -ScriptPath $ps1Path
+
+            Test-Path -LiteralPath $vbsPath | Should -BeTrue
+            $bytes = [System.IO.File]::ReadAllBytes($vbsPath)
+            if ($bytes.Count -ge 3) {
+                $bytes[0..2] | Should -Not -Be @(0xEF, 0xBB, 0xBF)
+            }
+            $content = Get-Content -LiteralPath $vbsPath -Raw
+            $content | Should -Match 'Chr\(34\)'
+        }
+        finally {
+            $script:PS1TimerPwsh = $savedPwsh
+            Remove-Item -LiteralPath $ps1Path -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $vbsPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     It "Get-TimerAfterStartAction returns config default and override" {
         Get-TimerAfterStartAction | Should -Be 'none'
         Get-TimerAfterStartAction -Override 'watch' | Should -Be 'watch'
     }
 
-    It "Sync-TimerData skips scheduled-task lookup when end time is far in the future" {
-        Mock Get-PSTimerScheduledTaskNames { throw 'should not be called' }
-        $future = (Get-Date).AddMinutes(30).ToString('o')
-        $timers = @(
-            [PSCustomObject]@{
-                Id = '1'; State = 'Running'; EndTime = $future; Seconds = 1800
-                TaskName = 'PSTimer_1_abcdef01'; Duration = '30m'; Message = 'x'
-                StartTime = (Get-Date).ToString('o')
-                RepeatTotal = 1; RepeatRemaining = 0; CurrentRun = 1
-                IsSequence = $false
+    It "Get-SequenceTimerIntroSpeechText returns workout intro only" {
+        $saved = $global:Config
+        try {
+            $global:Config = @{
+                TimerDefaults = @{ Visual = 'none'; Sound = $false; Voice = $true }
+                VoiceTemplates = @{
+                    WorkoutStart = 'Starting {description}, {duration}'
+                    PhaseStart   = '{label}'
+                }
+                Workouts = @{
+                    'test-routine' = @{ Description = 'Test session' }
+                }
             }
-        )
-        Mock Get-TimerData { return $timers }
-        { Sync-TimerData } | Should -Not -Throw
-        Assert-MockCalled Get-PSTimerScheduledTaskNames -Times 0 -Exactly
+            Initialize-PS1TimerModuleConfig
+            $summary = [PSCustomObject]@{ TotalDuration = '5m'; TotalSeconds = 300 }
+            $firstPhase = [PSCustomObject]@{ Label = 'Warm up'; AnnounceStart = 'Begin warm up' }
+            $intro = Get-SequenceTimerIntroSpeechText -IsWorkout -WorkoutRoutine 'test-routine' -FirstPhase $firstPhase -StartTime (Get-Date) -Summary $summary -Phases @($firstPhase)
+            $intro | Should -Match 'Test session'
+            $intro | Should -Not -Match 'Begin warm up'
+
+            $texts = Get-SequenceTimerStartSpeechTexts -IsWorkout -WorkoutRoutine 'test-routine' -FirstPhase $firstPhase -StartTime (Get-Date) -Summary $summary -Phases @($firstPhase)
+            $texts.Count | Should -Be 1
+            $texts[0] | Should -Match 'Test session'
+        }
+        finally {
+            $global:Config = $saved
+            Initialize-PS1TimerModuleConfig
+        }
+    }
+
+    It "Sync-TimerData verifies scheduled task when phase has time left after sleep" {
+        $existing = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        [void]$existing.Add('PSTimer_1_abcdef01')
+        Set-TimerTestScheduledTaskNamesResultOverride $existing
+        Mock Start-TimerScheduledJob { }
+
+        $future = (Get-Date).AddMinutes(30).ToString('o')
+        $timer = [PSCustomObject]@{
+            Id = '1'; State = 'Running'; EndTime = $future; Seconds = 1800
+            TaskName = 'PSTimer_1_abcdef01'; Duration = '30m'; Message = 'x'
+            StartTime = (Get-Date).ToString('o')
+            RepeatTotal = 1; RepeatRemaining = 0; CurrentRun = 1
+            IsSequence = $false
+        }
+        Save-TimerData -Timers @($timer)
+
+        $result = Sync-TimerData
+
+        $result[0].State | Should -Be 'Running'
+        Assert-MockCalled Start-TimerScheduledJob -Times 0 -Exactly
     }
 }
 
@@ -1181,6 +1536,30 @@ Describe "Fire script generation" {
             if (Test-Path -LiteralPath $generated) { Remove-Item -LiteralPath $generated -Force }
         }
     }
+
+    It "repeat fire script preserves notify fields across JSON updates" {
+        $saved = $global:Config
+        try {
+            $global:Config = @{
+                TimerDefaults = @{ Visual = 'none'; Sound = $true; Webhook = 'timer' }
+                Webhooks = @{ 'timer' = 'https://example.com/hook' }
+            }
+            Initialize-PS1TimerModuleConfig
+            Timer -Time '5s' -Message 'water' -Repeat 3
+
+            $scriptPath = Join-Path $env:TEMP 'PSTimer_1.ps1'
+            $content = Get-Content -LiteralPath $scriptPath -Raw
+            $content | Should -Match '\$notifyProps'
+            $content | Should -Match 'NotifyVisual'
+            $content | Should -Match '\$notifyVisual = ''none'''
+        }
+        finally {
+            $global:Config = $saved
+            Initialize-PS1TimerModuleConfig
+            $generated = Join-Path $env:TEMP 'PSTimer_1.ps1'
+            if (Test-Path -LiteralPath $generated) { Remove-Item -LiteralPath $generated -Force }
+        }
+    }
 }
 
 Describe "Write-SequenceTimerConfirmation" {
@@ -1259,6 +1638,210 @@ Describe "Resolve-TimerNotificationSettings" {
         finally {
             $global:Config = $saved
             Initialize-PS1TimerModuleConfig
+        }
+    }
+
+    It "applies preset Voice and Countdown overrides" {
+        $saved = $global:Config
+        try {
+            $global:Config = @{ TimerDefaults = @{ Visual = 'none'; Sound = $false; Voice = $false; Countdown = 'none' } }
+            Initialize-PS1TimerModuleConfig
+            $result = Resolve-TimerNotificationSettings -PresetVoice $true -PresetCountdown '321'
+            $result.Voice | Should -BeTrue
+            $result.Countdown | Should -Be '321'
+            $result.Label | Should -Be 'voice + countdown (321)'
+        }
+        finally {
+            $global:Config = $saved
+            Initialize-PS1TimerModuleConfig
+        }
+    }
+}
+
+Describe "Get-TimerFireScriptVoiceBlock" {
+    It "returns empty when Voice is false" {
+        Get-TimerFireScriptVoiceBlock -Voice $false | Should -Be ''
+    }
+
+    It "includes System.Speech when Voice is true" {
+        $block = Get-TimerFireScriptVoiceBlock -Voice $true -TextExpr '$announceText'
+        $block | Should -Match 'System\.Speech'
+        $block | Should -Match '\$announceText'
+    }
+}
+
+Describe "Write-TimerCueRegistrarFile" {
+    It "does not schedule duplicate phase-start cues" {
+        $path = Write-TimerCueRegistrarFile -TimerId '99' -VoiceName 'Test Voice' -VoiceRate 0 -VoiceVolume 100
+        $content = Get-Content -LiteralPath $path -Raw
+        $content | Should -Not -Match "CueType\s*=\s*'start'"
+        $content | Should -Not -Match '\$startText'
+    }
+
+    It "embeds ASCII VBS write for cue launchers" {
+        $path = Write-TimerCueRegistrarFile -TimerId '99' -VoiceName 'Test Voice' -VoiceRate 0 -VoiceVolume 100
+        $content = Get-Content -LiteralPath $path -Raw
+        $content | Should -Match '\[System\.Text\.Encoding\]::ASCII'
+        $content | Should -Match 'Chr\(34\)'
+        $content | Should -Not -Match 'WriteAllText\(\`\$cueVbs.*\`\$utf8\)'
+    }
+}
+
+Describe "Write-TimerSpeechQueueScriptFile" {
+    It "writes a hidden-process speech script with all queued lines" {
+        $path = Write-TimerSpeechQueueScriptFile -Texts @('Session intro', 'First phase') -VoiceName 'Test Voice' -VoiceRate -1 -VoiceVolume 90
+        $path | Should -Not -BeNullOrEmpty
+        Test-Path -LiteralPath $path | Should -BeTrue
+        $content = Get-Content -LiteralPath $path -Raw
+        $content | Should -Match 'System\.Speech'
+        $content | Should -Match 'Session intro'
+        $content | Should -Match 'First phase'
+        $content | Should -Match 'Test Voice'
+        Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Describe "Get-TimerWatchOptimisticNextPhaseDisplay" {
+    It "predicts the next sequence phase for watch UI" {
+        $timer = [PSCustomObject]@{
+            Id           = '1'
+            IsSequence   = $true
+            CurrentPhase = 0
+            TotalPhases  = 3
+            TotalSeconds = 120
+            Phases       = @(
+                [PSCustomObject]@{ Label = 'phase one'; Seconds = 30 }
+                [PSCustomObject]@{ Label = 'phase two'; Seconds = 45 }
+                [PSCustomObject]@{ Label = 'phase three'; Seconds = 45 }
+            )
+        }
+        $previousEnd = [DateTime]'2026-06-05T10:00:30'
+        $now = [DateTime]'2026-06-05T10:00:31'
+
+        $result = Get-TimerWatchOptimisticNextPhaseDisplay -Timer $timer -PreviousEndTime $previousEnd -Now $now
+
+        $result.DisplayTimer.CurrentPhase | Should -Be 1
+        $result.DisplayTimer.PhaseLabel | Should -Be 'phase two'
+        $result.DisplayTimer.Seconds | Should -Be 45
+        $result.EndTime | Should -Be $now.AddSeconds(45)
+    }
+}
+
+Describe "Timer-Workout" {
+    BeforeAll {
+        Mock Register-ScheduledTask { }
+        Mock Unregister-ScheduledTask { }
+        Mock Start-Job { }
+    }
+
+    BeforeEach {
+        Reset-TimerDataCacheForTests
+        if (Test-Path $script:TimerDataFile) { Remove-Item $script:TimerDataFile -Force }
+    }
+
+    It "starts workout timer with IsWorkout flag" {
+        $saved = $global:Config
+        try {
+            $global:Config = @{
+                TimerDefaults = @{ Visual = 'none'; Sound = $false; Voice = $false; Countdown = '321' }
+                Workouts = @{
+                    'tabata-hiit' = @{
+                        Pattern = '(20s work, 10s rest)x2'
+                        Voice = $true
+                        Countdown = '321'
+                    }
+                }
+            }
+            Initialize-PS1TimerModuleConfig
+            Mock Invoke-TimerSpeech { }
+            Mock Invoke-TimerSpeechQueueAsync { }
+            Mock Invoke-TimerPhaseCueRegistration { }
+            Mock Write-TimerCueRegistrarFile { return "$TestDrive/registrar.ps1" }
+
+            Timer-Workout -Routine 'tabata-hiit'
+
+            $timers = @(Get-TimerData)
+            $timers.Count | Should -Be 1
+            $timers[0].IsWorkout | Should -BeTrue
+            $timers[0].WorkoutRoutine | Should -Be 'tabata-hiit'
+            $timers[0].NotifyVoice | Should -BeTrue
+        }
+        finally {
+            $global:Config = $saved
+            Initialize-PS1TimerModuleConfig
+            if (Test-Path $script:TimerDataFile) { Remove-Item $script:TimerDataFile -Force }
+        }
+    }
+
+    It "speaks intro before starting workout timer when voice is enabled" {
+        $saved = $global:Config
+        try {
+            $global:Config = @{
+                TimerDefaults = @{ Visual = 'none'; Sound = $false; Voice = $false; Countdown = '321'; AfterStart = 'watch' }
+                VoiceTemplates = @{ WorkoutStart = 'Go'; PhaseStart = '{label}' }
+                Workouts = @{
+                    'tabata-hiit' = @{
+                        Pattern = '(20s work, 10s rest)x2'
+                        Voice = $true
+                        Countdown = '321'
+                    }
+                }
+            }
+            Initialize-PS1TimerModuleConfig
+            Mock Invoke-TimerSpeechQueueAsync { }
+            Mock Invoke-TimerSpeechQueue { }
+            Mock Invoke-TimerPhaseCueRegistration { }
+            Mock Write-TimerCueRegistrarFile { return "$TestDrive/registrar.ps1" }
+            Mock Invoke-TimerAfterStart { }
+
+            Timer-Workout -Routine 'tabata-hiit'
+
+            Assert-MockCalled Invoke-TimerSpeechQueue -Times 1 -Exactly
+            Assert-MockCalled Invoke-TimerSpeechQueueAsync -Times 0 -Exactly
+            Assert-MockCalled Invoke-TimerAfterStart -Times 1 -Exactly
+        }
+        finally {
+            $global:Config = $saved
+            Initialize-PS1TimerModuleConfig
+            if (Test-Path $script:TimerDataFile) { Remove-Item $script:TimerDataFile -Force }
+        }
+    }
+
+    It "starts workout via t workout without explicit -Countdown" {
+        $saved = $global:Config
+        try {
+            $global:Config = @{
+                TimerDefaults = @{ Visual = 'none'; Sound = $true; Voice = $false; Countdown = 'none'; Webhook = 'timer' }
+                Workouts = @{
+                    'gyors-nyujtas' = @{
+                        Pattern   = "45s 'stretch left', 45s 'stretch right'"
+                        Voice     = $true
+                        Sound     = $false
+                        Visual    = 'none'
+                        Countdown = 'none'
+                    }
+                }
+            }
+            Initialize-PS1TimerModuleConfig
+            Mock Invoke-TimerSpeech { }
+            Mock Invoke-TimerSpeechQueueAsync { }
+            Mock Invoke-TimerPhaseCueRegistration { }
+            Mock Write-TimerCueRegistrarFile { return "$TestDrive/registrar.ps1" }
+
+            Timer -Time workout -Message 'gyors-nyujtas'
+
+            $timers = @(Get-TimerData)
+            $timers.Count | Should -Be 1
+            $timers[0].IsWorkout | Should -BeTrue
+            $timers[0].WorkoutRoutine | Should -Be 'gyors-nyujtas'
+            $timers[0].CountdownMode | Should -Be 'none'
+            $timers[0].NotifyVoice | Should -BeTrue
+            $timers[0].NotifySound | Should -BeFalse
+        }
+        finally {
+            $global:Config = $saved
+            Initialize-PS1TimerModuleConfig
+            if (Test-Path $script:TimerDataFile) { Remove-Item $script:TimerDataFile -Force }
         }
     }
 }

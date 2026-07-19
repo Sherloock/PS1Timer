@@ -2,15 +2,7 @@
 
 BeforeAll {
     $ModuleRoot = Split-Path -Parent $PSScriptRoot
-    if (-not $global:Config) { $global:Config = @{} }
-    $exampleConfig = Join-Path $ModuleRoot 'config.example.ps1'
-    if (Test-Path -LiteralPath $exampleConfig) {
-        . $exampleConfig
-    }
-    . "$ModuleRoot\src\TimerHelpers.ps1"
-    . "$ModuleRoot\src\Timer.ps1"
-
-    $script:TimerDataFile = "$TestDrive\ps-timers.json"
+    . "$PSScriptRoot\PS1Timer.TestBootstrap.ps1" -ModuleRoot $ModuleRoot -TestDrive $TestDrive
 }
 
 Describe "ConvertTo-Seconds" {
@@ -194,6 +186,7 @@ Describe "Get-AnsiColors" {
                     }
                 }
             }
+            Initialize-PS1TimerModuleConfig
             $colors = Get-AnsiColors
             $colors.Theme | Should -Be 'custom'
             $colors.Primary | Should -Be "$([char]27)[96m"
@@ -323,7 +316,7 @@ Describe "TimerPresets" {
     )
 
     It "ships 19 built-in presets" {
-        $script:TimerPresets.Keys.Count | Should -Be 19
+        $script:TimerPresets.Keys.Count | Should -Be 22
     }
 
     It "contains all expected preset keys" {
@@ -385,6 +378,41 @@ Describe "ConvertFrom-LegacyNotifyMode" {
         $result = ConvertFrom-LegacyNotifyMode -Notify 'silent'
         $result.Visual | Should -Be 'none'
         $result.Sound | Should -BeFalse
+    }
+}
+
+Describe "Get-TimerNotifyChannelsFromTimer" {
+    It "falls back to TimerDefaults when notify fields are missing" {
+        $saved = $global:Config
+        try {
+            $global:Config = @{
+                TimerDefaults = @{ Visual = 'none'; Sound = $true; Voice = $false }
+            }
+            Initialize-PS1TimerModuleConfig
+            $timer = [PSCustomObject]@{
+                Id = '1'
+                Message = 'water'
+            }
+            $channels = Get-TimerNotifyChannelsFromTimer -Timer $timer
+            $channels.Visual | Should -Be 'none'
+            $channels.Sound | Should -BeTrue
+            $channels.Voice | Should -BeFalse
+        }
+        finally {
+            $global:Config = $saved
+            Initialize-PS1TimerModuleConfig
+        }
+    }
+
+    It "honors NotifyVisual none on timer records" {
+        $timer = [PSCustomObject]@{
+            Id = '1'
+            NotifyVisual = 'none'
+            NotifySound = $true
+        }
+        $channels = Get-TimerNotifyChannelsFromTimer -Timer $timer
+        $channels.Visual | Should -Be 'none'
+        $channels.Sound | Should -BeTrue
     }
 }
 
@@ -530,5 +558,125 @@ Describe "Parse-TimerAtTime" {
 
     It "returns null for invalid format" {
         Parse-TimerAtTime -At '2:30pm' | Should -BeNullOrEmpty
+    }
+}
+
+Describe "Resolve-TimerSpeechText" {
+    It "substitutes template tokens" {
+        Resolve-TimerSpeechText -TemplateKey 'PhaseStart' -Tokens @{ label = 'work' } | Should -Be 'work'
+        Resolve-TimerSpeechText -TemplateKey 'WorkoutStart' -Tokens @{
+            description = 'Push day'
+            duration    = '35m'
+            endTime     = '14:30'
+            phaseCount  = '16'
+            routine     = 'tabata'
+        } | Should -Match 'Push day'
+        Resolve-TimerSpeechText -TemplateKey 'WorkoutStart' -Tokens @{
+            description = 'Push day'
+            duration    = '35m'
+            endTime     = '14:30'
+            phaseCount  = '16'
+            routine     = 'tabata'
+        } | Should -Match '14:30'
+        Resolve-TimerSpeechText -TemplateKey 'CountdownTick' -Tokens @{ seconds = '3' } | Should -Be '3'
+    }
+}
+
+Describe "ConvertFrom-TimerSequence BeepAt" {
+    It "parses inline -BeepAt on a phase" {
+        $phases = @(ConvertFrom-TimerSequence -Pattern "45s 'hold left' -BeepAt 10s, 10s 'switch sides'")
+        $phases.Count | Should -Be 2
+        $phases[0].Label | Should -Be 'hold left'
+        $phases[0].BeepAt | Should -Be @(10)
+        $phases[1].Label | Should -Be 'switch sides'
+    }
+}
+
+Describe "Get-TimerPhaseCueSchedule" {
+    It "builds 321 countdown for 20s phase" {
+        $cues = Get-TimerPhaseCueSchedule -PhaseSeconds 20 -CountdownMode '321' -PhaseStartText 'work' -IncludePhaseStartAtZero
+        $cues.Count | Should -BeGreaterOrEqual 4
+        ($cues | Where-Object { $_.Text -eq '3' }).Count | Should -Be 1
+    }
+
+    It "skips 10-second warning for short phases" {
+        $cues = Get-TimerPhaseCueSchedule -PhaseSeconds 8 -CountdownMode 'both' -IncludePhaseStartAtZero
+        ($cues | Where-Object { $_.Text -eq '10' }).Count | Should -Be 0
+    }
+
+    It "adds mid-phase beeps at remaining offsets" {
+        $cues = Get-TimerPhaseCueSchedule -PhaseSeconds 300 -CountdownMode 'none' -BeepAtSeconds @(180, 60)
+        ($cues | Where-Object { $_.CueType -eq 'beep' -and $_.OffsetFromEnd -eq 180 }).Count | Should -Be 1
+        ($cues | Where-Object { $_.CueType -eq 'beep' -and $_.OffsetFromEnd -eq 60 }).Count | Should -Be 1
+    }
+
+    It "adds end beep 321 before next phase" {
+        $cues = Get-TimerPhaseCueSchedule -PhaseSeconds 45 -CountdownMode 'none' -IncludeEndBeep321
+        ($cues | Where-Object { $_.CueType -eq 'beep' }).Count | Should -Be 3
+        ($cues | Where-Object { $_.OffsetFromEnd -eq 1 }).Count | Should -Be 1
+    }
+}
+
+Describe "Parse-BeepAtList" {
+    It "parses comma-separated duration string" {
+        $result = Parse-BeepAtList -InputObject '3m,1m'
+        $result | Should -Be @(180, 60)
+    }
+
+    It "returns empty for blank input" {
+        Parse-BeepAtList -InputObject $null | Should -Be @()
+    }
+}
+
+Describe "ConvertFrom-WorkoutRoutine" {
+    It "expands pattern-only workout" {
+        $saved = $global:Config
+        try {
+            $global:Config = @{
+                Workouts = @{
+                    'tabata-hiit' = @{
+                        Pattern = '(20s work, 10s rest)x2'
+                        Countdown = '321'
+                    }
+                }
+            }
+            Initialize-PS1TimerModuleConfig
+            $phases = @(ConvertFrom-WorkoutRoutine -RoutineName 'tabata-hiit')
+            $phases.Count | Should -Be 4
+        }
+        finally {
+            $global:Config = $saved
+            Initialize-PS1TimerModuleConfig
+        }
+    }
+
+    It "expands exercise blocks with work and rest phases" {
+        $saved = $global:Config
+        try {
+            $global:Config = @{
+                Workouts = @{
+                    'mini' = @{
+                        Exercises = @(
+                            @{ Name = 'Squat'; Sets = 2; Work = '30s'; Rest = '15s' }
+                        )
+                    }
+                }
+            }
+            Initialize-PS1TimerModuleConfig
+            $phases = @(ConvertFrom-WorkoutRoutine -RoutineName 'mini')
+            $phases.Count | Should -Be 3
+            $phases[0].PhaseType | Should -Be 'work'
+            $phases[0].AnnounceStart | Should -Match 'Squat'
+        }
+        finally {
+            $global:Config = $saved
+            Initialize-PS1TimerModuleConfig
+        }
+    }
+}
+
+Describe "Format-TimerNotifyLabel" {
+    It "includes voice and countdown in label" {
+        Format-TimerNotifyLabel -Visual 'none' -Sound $false -Voice $true -CountdownMode '321' | Should -Be 'voice + countdown (321)'
     }
 }

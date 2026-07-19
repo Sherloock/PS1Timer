@@ -1,5 +1,23 @@
 # Troubleshooting
 
+## Huge sequence multiplier (absurd Final end, stuck timer, slow watch)
+
+**Symptoms:** `tl -w` shows **Final end** thousands of hours away, watch freezes or updates slowly, timer stuck with an overdue phase end, `%TEMP%\ps-timers.json` is very large (MB+).
+
+**Cause:** Sequence patterns like `(45m water)x10000` expand every repeat into stored phases. PS1Timer caps new sequences at **500 phases**; older timers may still have huge state files.
+
+**Fix:**
+
+```powershell
+. C:\path\to\PS1Timer\loader.ps1
+td <id>    # remove broken timer
+t water    # if preset uses Time + Repeat (simple repeating timer)
+# or:
+t 45m water -Repeat 100
+```
+
+For recurring reminders, prefer **simple timer repeat** (`-Repeat` or a preset with `Time` / `Message` / `Repeat`) instead of large `xN` sequence multipliers.
+
 ## Windows Script Host error on PSTimer_*.vbs
 
 **Symptom:** Popup: `Expected end of statement` (800A0401) on line 2 of `%TEMP%\PSTimer_<id>.vbs`.
@@ -7,6 +25,12 @@
 **Cause:** Older builds quoted `pwsh.exe` paths incorrectly when installed under `Program Files`.
 
 **Fix:** Update PS1Timer (VBS now uses `Chr(34)` quoting). Reload the module, remove the broken timer (`td <id>`), start again.
+
+**Symptom:** Popup: `Invalid character` (800A0408) at line 1 of `%TEMP%\PSTimer_<id>_cue_*.vbs` (often many stacked dialogs during voice countdown).
+
+**Cause:** Cue-task VBS launchers were written with a UTF-8 BOM, which VBScript cannot parse.
+
+**Fix:** Update PS1Timer (cue VBS is written as ASCII, same as the main timer wrapper). Reload the module, then remove and restart the timer (`td <id>` then start again) or resume (`tr <id>`) so cue tasks regenerate.
 
 ## Sequence stops after the first phase
 
@@ -42,6 +66,31 @@ Older versions blocked on `Register-ScheduledTask` for every `t` command. Curren
 tr <id>    # resume if remaining time was saved
 td <id>    # or remove and start fresh
 ```
+
+## Timers gone after sleep / hibernate
+
+**Symptoms:** You had water or other long-running timers before sleep; after wake, `tl` shows **No active timers**.
+
+**Likely cause:** Default `tl` hides **Lost** and **Completed** timers. Sleep can drop one-shot scheduled tasks while `%TEMP%\ps-timers.json` still shows Running until sync runs.
+
+**Checks:**
+
+```powershell
+tl -a                              # show Lost / Completed too
+Get-Content $env:TEMP\ps-timers.json
+Get-Content $env:TEMP\PSTimer_<id>.log   # phase / registration errors
+```
+
+**Recovery:**
+
+```powershell
+tr <id>    # restart from saved remaining time (Lost timers)
+td <id>    # remove and start fresh
+```
+
+**Current behavior:** `tl` runs `Sync-TimerData`, which re-registers missing scheduled tasks when a phase still has time left. If the phase already ended during sleep, the fire script recovery advances sequences when possible; otherwise the timer may show **Lost** until you `tr` it.
+
+**Tip:** For a quick repro after updating PS1Timer: `t (2m water, 2m water)x2`, sleep past one phase, wake, run `tl` — the timer should still be active.
 
 ## Stale PSTimer_* tasks after upgrade
 

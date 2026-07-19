@@ -37,13 +37,20 @@ t 25m
 t 30m "Stretch break"
 t 1h30m "Deep work" 2          # repeat twice
 
-# Presets (19 built-in — no config setup needed)
+# Presets (22 built-in — no config setup needed)
 t pomodoro
-t tabata
+t tabata                     # voice + 3-2-1 coaching
+t workout upper-push         # structured routine
 tpre                           # interactive picker
+twko -List                     # list workout routines
 
 # Custom sequence
 t "(25m work, 5m rest)x4, 20m 'long break'"
+
+# Voice coaching
+t tabata -Voice
+t gym-sets -Voice -NoSound -Visual none
+t "(40s work, 20s rest)x10" -Voice -Countdown both
 
 # Manage running timers
 tl                             # list active timers
@@ -51,9 +58,10 @@ tw 1                           # progress view for timer #1
 tp 1; tr 1                     # pause / resume
 td done                        # remove completed timers
 
-# Notifications (Visual + Sound + optional Webhook)
+# Notifications (Visual + Sound + Voice + optional Webhook)
 t 25m -Visual toast -Sound
 t 10m -Visual none -Sound
+t tabata -Voice -NoSound
 t 5m -Visual none -NoSound
 t 25m -Webhook discord-main
 t 25m -Notify toast   # legacy shorthand
@@ -67,7 +75,8 @@ t 25m work -At "14:30"         # starts at 14:30 today
 
 | Command | Alias | Description |
 |---------|-------|-------------|
-| `Timer` | `t` | Start simple or sequence timer; bare `t` shows help |
+| `Timer` | `t` | Start simple or sequence timer; `t workout` for routines; bare `t` shows help |
+| `Timer-Workout` | `twko` | Structured workout with voice coaching |
 | `Timer-Presets` | `tpre` | Interactive preset picker |
 | `Timer-List` | `tl` | List timers (`-a` all, `-w` live watch) |
 | `Timer-Watch` | `tw` | Single-timer progress view |

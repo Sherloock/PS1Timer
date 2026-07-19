@@ -10,7 +10,7 @@ tpre                # interactive picker
 Timer-Presets       # same as tpre
 ```
 
-## Shipped presets (19)
+## Shipped presets (22)
 
 | Name | Pattern | Use case |
 |------|---------|----------|
@@ -25,14 +25,21 @@ Timer-Presets       # same as tpre
 | `deep-focus-3h` | `(50m focus, 10m break)x3` | ~3 hour deep work |
 | `power-nap` | `20m 'power nap'` | Rest |
 | `meditation` | `10m meditation` | Mindfulness |
-| `tabata` | `(20s work, 10s rest)x8` | HIIT Tabata |
+| `tabata` | `(20s work, 10s rest)x8` | HIIT Tabata + voice |
+| `hiit-30-30` | `(30s work, 30s rest)x10` | 30/30 HIIT + voice |
+| `emom-12` | `(1m work)x12` | EMOM + voice |
+| `amrap-20` | `20m 'amrap'` | AMRAP + voice |
 | `cooking-pasta` | `10m boil, 2m rest` | Pasta timer |
 | `cooking-rice` | `18m simmer` | Rice simmer |
 | `lecture` | `45m lecture, 15m break` | Study session |
-| `gym-sets` | `(3m set, 90s rest)x5` | Weight training |
+| `gym-sets` | `(3m set, 90s rest)x5` | Weight training + voice |
 | `two-minute` | `2m 'quick task'` | GTD micro-start |
 | `flowtime` | `(45m focus, 15m break)x4` | Flexible deep work |
 | `ultradian` | `(90m focus, 20m break)x2` | Natural rhythm |
+
+Workout-specific routines (exercise lists) live in **`Config.Workouts`** — see [workouts.md](workouts.md).
+
+Presets may set `Voice`, `Countdown`, `Visual`, and `Sound` per entry (e.g. `tabata` uses `Voice=$true`, `Countdown='321'`).
 
 ## Customize presets
 

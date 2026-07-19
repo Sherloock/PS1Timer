@@ -41,6 +41,22 @@ Use single quotes when the label contains spaces:
 t "(30m 'long break')x1"
 ```
 
+Per-phase mid-timer beeps (time remaining before phase ends):
+
+```powershell
+t "45s 'Piriformis stretch, left' -BeepAt 10s, 10s 'Switch sides'"
+```
+
+Human-readable multiline patterns in config:
+
+```powershell
+Pattern = @(
+    "45s 'Hold left' -BeepAt 10s"
+    "10s 'Switch sides'"
+    "45s 'Hold right' -BeepAt 10s"
+) -join ', '
+```
+
 ## Preset names
 
 If the string matches a preset key in `Config.Presets` (`config.example.ps1` or `config.ps1`), it expands to that preset's pattern before parsing.

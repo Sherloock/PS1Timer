@@ -13,10 +13,263 @@ $script:TimerDataCacheTime = [DateTime]::MinValue
 $script:PS1TimerPwsh = (Get-Command pwsh.exe -ErrorAction Stop).Source
 # Tests set $true so Register-ScheduledTask mocks apply in-process
 $script:TimerForceSyncRegister = $false
+$script:PS1TimerTestMode = $false
 # Cached PSTimer_* scheduled task names (avoids repeated COM/CIM enumeration)
 $script:TimerTaskNameCache = $null
 $script:TimerTaskNameCacheTime = [DateTime]::MinValue
 $script:TimerTaskNameCacheTtlSeconds = 2
+$script:TimerStaleCleanupLastRun = [DateTime]::MinValue
+$script:TimerStaleCleanupIntervalSeconds = 5
+$script:TimerDataMutexName = 'Global\PS1Timer_ps-timers_json'
+$script:TimerDataFileLockTimeoutMs = 8000
+$script:TimerDataFileIoRetryCount = 8
+$script:TimerDataFileIoRetryDelayMs = 50
+$script:MaxSequencePhases = 500
+if ($global:Config -and $global:Config.MaxSequencePhases) {
+    $script:MaxSequencePhases = [int]$global:Config.MaxSequencePhases
+}
+
+function Test-TimerSimpleRepeatingPreset {
+    <#
+    .SYNOPSIS
+        True when a preset defines a simple repeating timer (Time + Repeat, no sequence Pattern).
+    #>
+    param($Preset)
+
+    if (-not $Preset) { return $false }
+    if (-not $Preset.Time) { return $false }
+    if ($Preset.Pattern) { return $false }
+    if ($Preset.Repeat -and [int]$Preset.Repeat -ge 1) { return $true }
+    return $false
+}
+
+function Get-TimerPresetNotifyOverrides {
+    param($Preset)
+
+    $result = @{
+        Notify    = $null
+        Visual    = $null
+        Sound     = $null
+        Voice     = $null
+        Webhook   = $null
+        Countdown = $null
+    }
+    if (-not $Preset) { return $result }
+
+    if ($Preset.Notify) { $result.Notify = $Preset.Notify }
+    if ($Preset.Visual) { $result.Visual = $Preset.Visual }
+    if ($Preset.ContainsKey('Sound')) { $result.Sound = [bool]$Preset.Sound }
+    if ($Preset.ContainsKey('Voice')) { $result.Voice = [bool]$Preset.Voice }
+    if ($Preset.Webhook) { $result.Webhook = $Preset.Webhook }
+    if ($Preset.Countdown) { $result.Countdown = [string]$Preset.Countdown }
+    return $result
+}
+
+function Test-TimerUniformPhaseSeconds {
+    <#
+    .SYNOPSIS
+        True when every phase from an index through the end uses the same duration.
+    #>
+    param(
+        [PSCustomObject]$Timer,
+        [int]$FromPhaseIndex = -1
+    )
+
+    if (-not $Timer.Phases -or $Timer.Phases.Count -eq 0) { return $false }
+
+    $startIndex = if ($FromPhaseIndex -ge 0) { $FromPhaseIndex } else { [int]$Timer.CurrentPhase }
+    if ($startIndex -lt 0 -or $startIndex -ge $Timer.Phases.Count) { return $false }
+
+    $referenceSeconds = [int]$Timer.Phases[$startIndex].Seconds
+    for ($i = $startIndex; $i -lt $Timer.Phases.Count; $i++) {
+        if ([int]$Timer.Phases[$i].Seconds -ne $referenceSeconds) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Sync-CatchUpUniformSequencePhase {
+    <#
+    .SYNOPSIS
+        Fast-forwards uniform sequences that are overdue by multiple phase durations.
+    #>
+    param(
+        [PSCustomObject]$Timer,
+        [DateTime]$Now
+    )
+
+    if (-not $Timer.IsSequence) { return $false }
+
+    $remaining = Get-TimerRemainingSeconds -Timer $Timer -Now $Now
+    if ($null -eq $remaining -or $remaining -gt 0) { return $false }
+
+    $phaseSeconds = [int]$Timer.Seconds
+    if ($phaseSeconds -le 0) { return $false }
+    if (-not (Test-TimerUniformPhaseSeconds -Timer $Timer)) { return $false }
+
+    $totalPhases = if ($Timer.PSObject.Properties.Name -contains 'TotalPhases') { [int]$Timer.TotalPhases } else { @($Timer.Phases).Count }
+    $currentPhase = [int]$Timer.CurrentPhase
+    if ($currentPhase -ge ($totalPhases - 1)) { return $false }
+
+    $elapsedSincePhaseEnd = [math]::Abs([int]$remaining)
+    $phasesToAdvance = [math]::Floor($elapsedSincePhaseEnd / $phaseSeconds)
+    if ($phasesToAdvance -lt 1) { return $false }
+
+    $newPhase = [math]::Min($currentPhase + $phasesToAdvance, $totalPhases - 1)
+    if ($newPhase -le $currentPhase) { return $false }
+
+    $phase = $Timer.Phases[$newPhase]
+    $offsetInPhase = $elapsedSincePhaseEnd % $phaseSeconds
+    $secondsLeftInPhase = if ($offsetInPhase -eq 0) { $phaseSeconds } else { $phaseSeconds - $offsetInPhase }
+
+    $Timer.CurrentPhase = $newPhase
+    $Timer.PhaseLabel = [string]$phase.Label
+    $Timer.Message = [string]$phase.Label
+    $Timer.Seconds = $phaseSeconds
+    $Timer.StartTime = $Now.ToString('o')
+    $Timer.EndTime = $Now.AddSeconds($secondsLeftInPhase).ToString('o')
+    $Timer.State = 'Running'
+    $Timer | Add-Member -NotePropertyName 'RemainingSeconds' -NotePropertyValue $null -Force
+
+    if ($Timer.PSObject.Properties.Name -contains 'TaskName') {
+        $null = Repair-TimerScheduledTaskIfMissing -Timer $Timer
+    }
+
+    return $true
+}
+
+function Get-TimerEmbeddedDataFileIoScript {
+    <#
+    .SYNOPSIS
+        PowerShell source embedded in scheduled-task fire scripts for safe JSON writes.
+    #>
+    return @'
+function Write-TimerDataFileAtomic {
+    param(
+        [Parameter(Mandatory)][string]$DataFile,
+        [Parameter(Mandatory)][string]$Content
+    )
+    $mutexName = 'Global\PS1Timer_ps-timers_json'
+    $utf8Bom = [System.Text.UTF8Encoding]::new($true)
+    $attempt = 0
+    while ($attempt -lt 8) {
+        $attempt++
+        $mutex = $null
+        $acquired = $false
+        try {
+            $mutex = [System.Threading.Mutex]::new($false, $mutexName)
+            $acquired = $mutex.WaitOne(8000)
+            if (-not $acquired) {
+                throw [System.IO.IOException]::new('Timed out waiting for timer data file lock.')
+            }
+            $tmpPath = "$DataFile.$([Guid]::NewGuid().ToString('N')).tmp"
+            try {
+                [System.IO.File]::WriteAllText($tmpPath, $Content, $utf8Bom)
+                [System.IO.File]::Move($tmpPath, $DataFile, $true)
+            }
+            finally {
+                if (Test-Path -LiteralPath $tmpPath) {
+                    Remove-Item -LiteralPath $tmpPath -Force -ErrorAction SilentlyContinue
+                }
+            }
+            return
+        }
+        catch [System.IO.IOException] {
+            if ($attempt -ge 8) { throw }
+            Start-Sleep -Milliseconds (50 * $attempt)
+        }
+        catch [System.UnauthorizedAccessException] {
+            if ($attempt -ge 8) { throw }
+            Start-Sleep -Milliseconds (50 * $attempt)
+        }
+        finally {
+            if ($mutex) {
+                if ($acquired) {
+                    try { $mutex.ReleaseMutex() } catch { }
+                }
+                $mutex.Dispose()
+            }
+        }
+    }
+}
+'@
+}
+
+function Invoke-WithTimerDataFileLock {
+    param(
+        [Parameter(Mandatory)][scriptblock]$Action,
+        [int]$TimeoutMs = $script:TimerDataFileLockTimeoutMs
+    )
+
+    $mutex = $null
+    $acquired = $false
+    try {
+        $mutex = [System.Threading.Mutex]::new($false, $script:TimerDataMutexName)
+        $acquired = $mutex.WaitOne($TimeoutMs)
+        if (-not $acquired) {
+            throw [System.IO.IOException]::new("Timed out waiting for timer data file lock ($script:TimerDataMutexName).")
+        }
+        return & $Action
+    }
+    finally {
+        if ($mutex) {
+            if ($acquired) {
+                try { $mutex.ReleaseMutex() } catch { }
+            }
+            $mutex.Dispose()
+        }
+    }
+}
+
+function Write-TimerDataFileContent {
+    param(
+        [Parameter(Mandatory)][string]$Content,
+        [string]$Path = $script:TimerDataFile
+    )
+
+    $utf8Bom = [System.Text.UTF8Encoding]::new($true)
+    $dir = [System.IO.Path]::GetDirectoryName($Path)
+    if (-not [string]::IsNullOrWhiteSpace($dir) -and -not (Test-Path -LiteralPath $dir)) {
+        $null = New-Item -ItemType Directory -Path $dir -Force
+    }
+
+    $tmpPath = "$Path.$([Guid]::NewGuid().ToString('N')).tmp"
+    try {
+        [System.IO.File]::WriteAllText($tmpPath, $Content, $utf8Bom)
+        [System.IO.File]::Move($tmpPath, $Path, $true)
+    }
+    catch {
+        if (Test-Path -LiteralPath $tmpPath) {
+            Remove-Item -LiteralPath $tmpPath -Force -ErrorAction SilentlyContinue
+        }
+        throw
+    }
+}
+
+function Invoke-TimerDataFileIo {
+    param(
+        [Parameter(Mandatory)][scriptblock]$Action,
+        [int]$RetryCount = $script:TimerDataFileIoRetryCount,
+        [int]$RetryDelayMs = $script:TimerDataFileIoRetryDelayMs
+    )
+
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        try {
+            return Invoke-WithTimerDataFileLock -Action $Action
+        }
+        catch [System.IO.IOException] {
+            if ($attempt -ge $RetryCount) { throw }
+            Start-Sleep -Milliseconds ($RetryDelayMs * $attempt)
+        }
+        catch [System.UnauthorizedAccessException] {
+            if ($attempt -ge $RetryCount) { throw }
+            Start-Sleep -Milliseconds ($RetryDelayMs * $attempt)
+        }
+    }
+}
 
 function Get-TimerData {
     <#
@@ -45,7 +298,9 @@ function Read-TimerDataFromFile {
     }
 
     try {
-        $content = [System.IO.File]::ReadAllText($script:TimerDataFile)
+        $content = Invoke-TimerDataFileIo -Action {
+            [System.IO.File]::ReadAllText($script:TimerDataFile)
+        }
         if ([string]::IsNullOrWhiteSpace($content)) {
             return @()
         }
@@ -120,8 +375,9 @@ function Save-TimerData {
     param([array]$Timers)
 
     if ($Timers.Count -eq 0) {
-        $utf8Bom = New-Object System.Text.UTF8Encoding $true
-        [System.IO.File]::WriteAllText($script:TimerDataFile, '[]', $utf8Bom)
+        Invoke-TimerDataFileIo -Action {
+            Write-TimerDataFileContent -Content '[]'
+        } | Out-Null
         $script:TimerDataCache = @()
         $fileInfo = Get-Item -LiteralPath $script:TimerDataFile -ErrorAction SilentlyContinue
         $script:TimerDataCacheTime = if ($fileInfo) { $fileInfo.LastWriteTime } else { Get-Date }
@@ -149,17 +405,44 @@ function Save-TimerData {
             }
 
             # Add sequence-specific fields if present
-            if ($t.PSObject.Properties.Name -contains 'NotifyVisual' -and $t.NotifyVisual) {
-                $obj | Add-Member -NotePropertyName 'NotifyVisual' -NotePropertyValue $t.NotifyVisual
+            if ($t.PSObject.Properties.Name -contains 'NotifyVisual') {
+                $obj | Add-Member -NotePropertyName 'NotifyVisual' -NotePropertyValue ([string]$t.NotifyVisual)
             }
             if ($t.PSObject.Properties.Name -contains 'NotifySound') {
                 $obj | Add-Member -NotePropertyName 'NotifySound' -NotePropertyValue ([bool]$t.NotifySound)
+            }
+            if ($t.PSObject.Properties.Name -contains 'NotifyVoice') {
+                $obj | Add-Member -NotePropertyName 'NotifyVoice' -NotePropertyValue ([bool]$t.NotifyVoice)
             }
             if ($t.PSObject.Properties.Name -contains 'NotifyType' -and $t.NotifyType) {
                 $obj | Add-Member -NotePropertyName 'NotifyType' -NotePropertyValue $t.NotifyType
             }
             if ($t.PSObject.Properties.Name -contains 'WebhookName' -and $t.WebhookName) {
                 $obj | Add-Member -NotePropertyName 'WebhookName' -NotePropertyValue $t.WebhookName
+            }
+            if ($t.PSObject.Properties.Name -contains 'VoiceName' -and $t.VoiceName) {
+                $obj | Add-Member -NotePropertyName 'VoiceName' -NotePropertyValue $t.VoiceName
+            }
+            if ($t.PSObject.Properties.Name -contains 'VoiceRate') {
+                $obj | Add-Member -NotePropertyName 'VoiceRate' -NotePropertyValue ([int]$t.VoiceRate)
+            }
+            if ($t.PSObject.Properties.Name -contains 'VoiceVolume') {
+                $obj | Add-Member -NotePropertyName 'VoiceVolume' -NotePropertyValue ([int]$t.VoiceVolume)
+            }
+            if ($t.PSObject.Properties.Name -contains 'CountdownMode' -and $t.CountdownMode) {
+                $obj | Add-Member -NotePropertyName 'CountdownMode' -NotePropertyValue $t.CountdownMode
+            }
+            if ($t.PSObject.Properties.Name -contains 'CueTaskNames' -and $t.CueTaskNames) {
+                $obj | Add-Member -NotePropertyName 'CueTaskNames' -NotePropertyValue @($t.CueTaskNames)
+            }
+            if ($t.PSObject.Properties.Name -contains 'BeepAt' -and $t.BeepAt) {
+                $obj | Add-Member -NotePropertyName 'BeepAt' -NotePropertyValue @($t.BeepAt | ForEach-Object { [int]$_ })
+            }
+            if ($t.PSObject.Properties.Name -contains 'IsWorkout') {
+                $obj | Add-Member -NotePropertyName 'IsWorkout' -NotePropertyValue ([bool]$t.IsWorkout)
+            }
+            if ($t.PSObject.Properties.Name -contains 'WorkoutRoutine' -and $t.WorkoutRoutine) {
+                $obj | Add-Member -NotePropertyName 'WorkoutRoutine' -NotePropertyValue $t.WorkoutRoutine
             }
 
             if ($t.IsSequence) {
@@ -175,8 +458,10 @@ function Save-TimerData {
         }
     }
 
-    $utf8Bom = New-Object System.Text.UTF8Encoding $true
-    [System.IO.File]::WriteAllText($script:TimerDataFile, (ConvertTo-Json -InputObject $clean -Depth 10 -Compress), $utf8Bom)
+    $json = ConvertTo-Json -InputObject $clean -Depth 12 -Compress
+    Invoke-TimerDataFileIo -Action {
+        Write-TimerDataFileContent -Content $json
+    } | Out-Null
     $script:TimerDataCache = @($clean)
     $fileInfo = Get-Item -LiteralPath $script:TimerDataFile -ErrorAction SilentlyContinue
     $script:TimerDataCacheTime = if ($fileInfo) { $fileInfo.LastWriteTime } else { Get-Date }
@@ -220,14 +505,148 @@ function Invoke-TimerFireScriptRecovery {
     }
 }
 
+function Get-TimerRemainingSeconds {
+    param(
+        [PSCustomObject]$Timer,
+        [DateTime]$Now = (Get-Date)
+    )
+
+    if (-not $Timer.EndTime) { return $null }
+    try {
+        return [int]([DateTime]::Parse($Timer.EndTime) - $Now).TotalSeconds
+    }
+    catch {
+        return $null
+    }
+}
+
+function Copy-SyncTimerFieldsFromRefreshed {
+    param(
+        [PSCustomObject]$Timer,
+        [PSCustomObject]$Refreshed
+    )
+
+    foreach ($prop in @('State', 'EndTime', 'StartTime', 'CurrentPhase', 'PhaseLabel', 'Seconds', 'Message', 'TaskName', 'RepeatRemaining', 'CurrentRun')) {
+        if ($Refreshed.PSObject.Properties.Name -contains $prop) {
+            $Timer.$prop = $Refreshed.$prop
+        }
+    }
+}
+
+function Merge-SyncTimerChanges {
+    <#
+    .SYNOPSIS
+        Merges in-memory sync edits into a fresh JSON read so concurrent updates are not clobbered.
+    #>
+    param(
+        [array]$Timers,
+        [System.Collections.Generic.HashSet[string]]$ModifiedIds
+    )
+
+    if ($null -eq $ModifiedIds -or $ModifiedIds.Count -eq 0) {
+        return $Timers
+    }
+
+    $fresh = @(Get-TimerData -Force)
+    if ($fresh.Count -eq 0) {
+        return $Timers
+    }
+
+    $editedById = @{}
+    foreach ($t in $Timers) {
+        if ($ModifiedIds.Contains([string]$t.Id)) {
+            $editedById[[string]$t.Id] = $t
+        }
+    }
+
+    $merged = [System.Collections.Generic.List[object]]::new()
+    foreach ($t in $fresh) {
+        $id = [string]$t.Id
+        if ($editedById.ContainsKey($id)) {
+            $merged.Add($editedById[$id])
+        }
+        else {
+            $merged.Add($t)
+        }
+    }
+
+    return $merged.ToArray()
+}
+
+function Repair-TimerScheduledTaskIfMissing {
+    <#
+    .SYNOPSIS
+        Re-registers the fire script and scheduled task when JSON says Running but the task is gone.
+    #>
+    param(
+        [PSCustomObject]$Timer,
+        [System.Collections.Generic.HashSet[string]]$TaskNames
+    )
+
+    $taskName = Get-TimerTaskName -Timer $Timer
+    if ([string]::IsNullOrWhiteSpace($taskName)) {
+        $taskName = New-TimerTaskName -TimerId $Timer.Id
+        $Timer | Add-Member -NotePropertyName 'TaskName' -NotePropertyValue $taskName -Force
+    }
+
+    if ($null -ne $TaskNames -and $TaskNames.Contains($taskName)) {
+        return $false
+    }
+
+    Start-TimerScheduledJob -Timer $Timer
+    Invoke-RegisterTimerResumeCues -Timer $Timer
+
+    if ($null -ne $TaskNames) {
+        [void]$TaskNames.Add($taskName)
+        if ($Timer.PSObject.Properties.Name -contains 'TaskName' -and $Timer.TaskName) {
+            [void]$TaskNames.Add([string]$Timer.TaskName)
+        }
+        if ($Timer.PSObject.Properties.Name -contains 'CueTaskNames' -and $Timer.CueTaskNames) {
+            foreach ($cue in @($Timer.CueTaskNames)) {
+                if (-not [string]::IsNullOrWhiteSpace($cue)) {
+                    [void]$TaskNames.Add([string]$cue)
+                }
+            }
+        }
+    }
+
+    return $true
+}
+
+function Add-TimerActiveScheduledTaskNames {
+    param(
+        [System.Collections.Generic.HashSet[string]]$ActiveNames,
+        [PSCustomObject]$Timer
+    )
+
+    if ($Timer.TaskName) {
+        [void]$ActiveNames.Add([string]$Timer.TaskName)
+    }
+    if ($Timer.PSObject.Properties.Name -contains 'CueTaskNames' -and $Timer.CueTaskNames) {
+        foreach ($cue in @($Timer.CueTaskNames)) {
+            if (-not [string]::IsNullOrWhiteSpace($cue)) {
+                [void]$ActiveNames.Add([string]$cue)
+            }
+        }
+    }
+}
+
 function Remove-StalePSTimerScheduledTasks {
     <#
     .SYNOPSIS
         Deletes PSTimer_* tasks that are not referenced by any timer record.
     #>
+    $timers = @(Get-TimerData)
+    if ($timers.Count -eq 0 -and (Test-Path -LiteralPath $script:TimerDataFile)) {
+        $fileInfo = Get-Item -LiteralPath $script:TimerDataFile -ErrorAction SilentlyContinue
+        if ($fileInfo -and $fileInfo.Length -gt 2) {
+            return 0
+        }
+    }
+
     $activeNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($t in @(Get-TimerData)) {
-        if ($t.TaskName) { [void]$activeNames.Add([string]$t.TaskName) }
+    foreach ($t in $timers) {
+        Add-TimerActiveScheduledTaskNames -ActiveNames $activeNames -Timer $t
     }
 
     $existing = Get-PSTimerScheduledTaskNames -ForceRefresh
@@ -254,64 +673,150 @@ function Sync-TimerData {
     .DESCRIPTION
         Checks if scheduled tasks exist for running timers.
         Only marks as Lost if task is missing AND end time has passed.
+        Re-registers missing tasks while a phase still has time left (e.g. after sleep).
     #>
     $timers = @(Get-TimerData)
     $changed = $false
+    $modifiedIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $now = Get-Date
     $taskNames = $null
 
     foreach ($timer in $timers) {
         if ($timer.State -ne 'Running' -and $timer.State -ne 'Scheduled') { continue }
 
-        try {
-            $endTime = [DateTime]::Parse($timer.EndTime)
-            $remaining = [int]($endTime - $now).TotalSeconds
-        }
-        catch {
+        $remaining = Get-TimerRemainingSeconds -Timer $timer -Now $now
+        if ($null -eq $remaining) {
             $timer.State = 'Lost'
             $timer | Add-Member -NotePropertyName 'RemainingSeconds' -NotePropertyValue $timer.Seconds -Force
             $changed = $true
+            [void]$modifiedIds.Add([string]$timer.Id)
             continue
+        }
+
+        if ($remaining -le 0 -and $timer.IsSequence) {
+            if (Sync-CatchUpUniformSequencePhase -Timer $timer -Now $now) {
+                $changed = $true
+                [void]$modifiedIds.Add([string]$timer.Id)
+                continue
+            }
         }
 
         if ($remaining -le -10) {
             $null = Invoke-TimerFireScriptRecovery -Timer $timer
             $refreshed = Find-TimerById -Timers @(Get-TimerData -Force) -Id $timer.Id
-            if ($refreshed -and $refreshed.State -ne $timer.State) {
-                $timer.State = $refreshed.State
-                $changed = $true
+            if ($refreshed) {
+                if ($refreshed.State -ne $timer.State) {
+                    $timer.State = $refreshed.State
+                    $changed = $true
+                    [void]$modifiedIds.Add([string]$timer.Id)
+                }
+                Copy-SyncTimerFieldsFromRefreshed -Timer $timer -Refreshed $refreshed
+                $remaining = Get-TimerRemainingSeconds -Timer $timer -Now $now
             }
             if ($timer.State -ne 'Running' -and $timer.State -ne 'Scheduled') {
                 continue
             }
         }
 
-        # Trust JSON while the phase still has time left (avoids scheduler lookup per timer)
-        if ($remaining -gt 2) { continue }
-
-        $taskName = Get-TimerTaskName -Timer $timer
         if ($null -eq $taskNames) {
             $taskNames = Get-PSTimerScheduledTaskNames
         }
 
-        if ($null -ne $taskNames -and $taskNames.Contains($taskName)) {
+        if ($null -ne $taskNames) {
+            $taskName = Get-TimerTaskName -Timer $timer
+            $taskExists = $taskNames.Contains($taskName)
+
+            if ($remaining -gt 0 -and -not $taskExists) {
+                if (Repair-TimerScheduledTaskIfMissing -Timer $timer -TaskNames $taskNames) {
+                    $changed = $true
+                    [void]$modifiedIds.Add([string]$timer.Id)
+                    $taskExists = $true
+                }
+            }
+
+            if ($remaining -gt 2 -and $taskExists) {
+                continue
+            }
+
+            if ($taskExists) {
+                continue
+            }
+        }
+        elseif ($remaining -gt 2) {
             continue
         }
 
         if ($remaining -le 0) {
+            if ($null -eq $taskNames) {
+                continue
+            }
+
+            if (Test-TimerWatchAwaitingContinuation -Timer $timer) {
+                $refreshed = Find-TimerById -Timers @(Get-TimerData -Force) -Id $timer.Id
+                if ($refreshed) {
+                    if ($refreshed.State -eq 'Completed') {
+                        $timer.State = 'Completed'
+                        if ($refreshed.PSObject.Properties.Name -contains 'TaskName') {
+                            $timer.TaskName = $refreshed.TaskName
+                        }
+                        $changed = $true
+                        [void]$modifiedIds.Add([string]$timer.Id)
+                        continue
+                    }
+                    if ($refreshed.State -in @('Running', 'Scheduled') -and $refreshed.EndTime) {
+                        try {
+                            $newEnd = [DateTime]::Parse($refreshed.EndTime)
+                            $phaseAdvanced = $timer.IsSequence -and ($null -ne $refreshed.CurrentPhase) -and ([int]$refreshed.CurrentPhase -gt [int]$timer.CurrentPhase)
+                            if ($newEnd -gt $now -or $phaseAdvanced) {
+                                Copy-SyncTimerFieldsFromRefreshed -Timer $timer -Refreshed $refreshed
+                                $changed = $true
+                                [void]$modifiedIds.Add([string]$timer.Id)
+                                continue
+                            }
+                        }
+                        catch { }
+                    }
+                }
+
+                $remaining = Get-TimerRemainingSeconds -Timer $timer -Now $now
+                if ($null -ne $remaining -and $remaining -gt 0) {
+                    if ($null -ne $taskNames) {
+                        $null = Repair-TimerScheduledTaskIfMissing -Timer $timer -TaskNames $taskNames
+                    }
+                    $changed = $true
+                    [void]$modifiedIds.Add([string]$timer.Id)
+                    continue
+                }
+
+                # Fire script may still be speaking; avoid Lost until transition finishes
+                if ($null -ne $remaining -and $remaining -gt -30) {
+                    continue
+                }
+            }
+
             $timer.State = 'Lost'
             $timer | Add-Member -NotePropertyName 'RemainingSeconds' -NotePropertyValue 0 -Force
             $changed = $true
+            [void]$modifiedIds.Add([string]$timer.Id)
         }
     }
 
     if ($changed) {
-        Save-TimerData -Timers $timers
-        $timers = @(Get-TimerData -Force)
+        try {
+            $toSave = Merge-SyncTimerChanges -Timers $timers -ModifiedIds $modifiedIds
+            Save-TimerData -Timers $toSave
+            $timers = @(Get-TimerData -Force)
+        }
+        catch {
+            # Another console may be writing ps-timers.json at the same time; retry next loop.
+        }
     }
 
     if (-not $script:TimerForceSyncRegister) {
-        $null = Remove-StalePSTimerScheduledTasks
+        if (((Get-Date) - $script:TimerStaleCleanupLastRun).TotalSeconds -ge $script:TimerStaleCleanupIntervalSeconds) {
+            $null = Remove-StalePSTimerScheduledTasks
+            $script:TimerStaleCleanupLastRun = Get-Date
+        }
     }
 
     return $timers
@@ -392,7 +897,7 @@ function Get-TimerForWatch {
         [array]$Timers,
         [string]$Id
     )
-    $active = @($Timers | Where-Object { $_.State -eq 'Running' -or $_.State -eq 'Scheduled' })
+    $active = @($Timers | Where-Object { $_.State -in @('Running', 'Scheduled', 'Paused') })
     if ($active.Count -eq 0) {
         return @{ Error = 'NoActive' }
     }
@@ -410,7 +915,7 @@ function Get-TimerForWatch {
     if (-not $t) {
         return @{ Error = 'NotFound'; Id = $Id }
     }
-    if ($t.State -ne 'Running' -and $t.State -ne 'Scheduled') {
+    if ($t.State -ne 'Running' -and $t.State -ne 'Scheduled' -and $t.State -ne 'Paused') {
         return @{ Error = 'NotRunning'; Id = $Id; State = $t.State }
     }
     return @{ Timer = $t }
@@ -685,8 +1190,16 @@ function Get-TimerFinalEndTime {
         $futureSeconds = 0
         if ($Timer.Phases) {
             $currentPhase = [int]$Timer.CurrentPhase
-            for ($i = $currentPhase + 1; $i -lt $Timer.Phases.Count; $i++) {
-                $futureSeconds += [int]$Timer.Phases[$i].Seconds
+            $remainingPhaseCount = $Timer.Phases.Count - $currentPhase - 1
+            if ($remainingPhaseCount -gt 0) {
+                if (Test-TimerUniformPhaseSeconds -Timer $Timer -FromPhaseIndex $currentPhase) {
+                    $futureSeconds = $remainingPhaseCount * [int]$Timer.Phases[$currentPhase].Seconds
+                }
+                else {
+                    for ($i = $currentPhase + 1; $i -lt $Timer.Phases.Count; $i++) {
+                        $futureSeconds += [int]$Timer.Phases[$i].Seconds
+                    }
+                }
             }
         }
         return $endTime.AddSeconds($futureSeconds)
@@ -906,6 +1419,135 @@ function Wait-OneSecondOrKeyPress {
     return $false
 }
 
+function Get-TimerWatchActiveTimers {
+    param([array]$Timers)
+    return @($Timers | Where-Object { $_.State -in @('Running', 'Paused', 'Scheduled') } | Sort-Object { [int]$_.Id })
+}
+
+function Get-TimerWatchFooterText {
+    param(
+        [hashtable]$Colors,
+        [switch]$ShowHelp
+    )
+    if ($ShowHelp) {
+        return @(
+            "$($Colors.Dim)  Esc exit  |  Space pause/resume  |  Up/Down timer$($Colors.Reset)"
+            "$($Colors.Dim)  Right next phase  |  Left restart/prev(<=3s)  |  ? help$($Colors.Reset)"
+        ) -join [Environment]::NewLine
+    }
+    return "$($Colors.Dim)  Esc exit  |  Space pause  |  Up/Down timer  |  Left/Right phase  |  ? help$($Colors.Reset)"
+}
+
+function Wait-TimerWatchInput {
+    param([System.Diagnostics.Stopwatch]$Stopwatch)
+    $remainingMs = 1000 - $Stopwatch.ElapsedMilliseconds
+    while ($remainingMs -gt 0) {
+        if ([Console]::KeyAvailable) {
+            $key = [Console]::ReadKey($true)
+            switch ($key.Key) {
+                'Escape' { return @{ Action = 'exit' } }
+                'Spacebar' { return @{ Action = 'togglePause' } }
+                'UpArrow' { return @{ Action = 'prevTimer' } }
+                'DownArrow' { return @{ Action = 'nextTimer' } }
+                'RightArrow' { return @{ Action = 'nextPhase' } }
+                'LeftArrow' { return @{ Action = 'prevPhase' } }
+                'Oem2' { return @{ Action = 'toggleHelp' } }
+                default {
+                    if ($key.KeyChar -eq '?') { return @{ Action = 'toggleHelp' } }
+                }
+            }
+            continue
+        }
+        $sleepMs = [math]::Min(50, $remainingMs)
+        Start-Sleep -Milliseconds $sleepMs
+        $remainingMs = 1000 - $Stopwatch.ElapsedMilliseconds
+    }
+    return @{ Action = 'tick' }
+}
+
+function Invoke-TimerSequencePhaseJump {
+    <#
+    .SYNOPSIS
+        Jumps a sequence timer to another phase or restarts the current phase.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$TimerId,
+        [ValidateSet('next', 'restart', 'prevOrRestart')]
+        [string]$Direction
+    )
+
+    $timers = @(Get-TimerData)
+    $timer = Find-TimerById -Timers $timers -Id $TimerId
+    if (-not $timer -or -not $timer.IsSequence) { return $false }
+
+    $phases = @($timer.Phases)
+    if ($phases.Count -eq 0) { return $false }
+
+    $currentPhase = [int]$timer.CurrentPhase
+    $targetPhase = $currentPhase
+
+    switch ($Direction) {
+        'next' {
+            if ($currentPhase -ge ($phases.Count - 1)) { return $false }
+            $targetPhase = $currentPhase + 1
+        }
+        'restart' {
+            $targetPhase = $currentPhase
+        }
+        'prevOrRestart' {
+            $phaseStart = [DateTime]::Parse($timer.StartTime)
+            $elapsed = ((Get-Date) - $phaseStart).TotalSeconds
+            if ($elapsed -le 3 -and $currentPhase -gt 0) {
+                $targetPhase = $currentPhase - 1
+            }
+            else {
+                $targetPhase = $currentPhase
+            }
+        }
+    }
+
+    Unregister-TimerCueTasks -Timer $timer
+    Stop-TimerTask -TimerId $TimerId -TaskName (Get-TimerTaskName -Timer $timer)
+
+    $phase = $phases[$targetPhase]
+    $seconds = [int]$phase.Seconds
+    $now = Get-Date
+    $timer.CurrentPhase = $targetPhase
+    $timer.PhaseLabel = [string]$phase.Label
+    $timer.Seconds = $seconds
+    $timer.Message = [string]$phase.Label
+    $timer.StartTime = $now.ToString('o')
+    $timer.EndTime = $now.AddSeconds($seconds).ToString('o')
+    $timer.State = 'Running'
+    $timer | Add-Member -NotePropertyName 'RemainingSeconds' -NotePropertyValue $null -Force
+    $timer | Add-Member -NotePropertyName 'TaskName' -NotePropertyValue (New-TimerTaskName -TimerId $timer.Id) -Force
+
+    Save-TimerData -Timers $timers
+    Start-TimerScheduledJob -Timer $timer
+    Invoke-RegisterTimerResumeCues -Timer $timer
+    return $true
+}
+
+function Switch-TimerWatchTarget {
+    param(
+        [array]$ActiveTimers,
+        [string]$CurrentId,
+        [ValidateSet('up', 'down')]
+        [string]$Direction
+    )
+    if ($ActiveTimers.Count -le 1) { return $CurrentId }
+    $ids = @($ActiveTimers | ForEach-Object { [string]$_.Id })
+    $idx = [array]::IndexOf($ids, [string]$CurrentId)
+    if ($idx -lt 0) { return [string]$ActiveTimers[0].Id }
+    if ($Direction -eq 'up') {
+        $idx = if ($idx -le 0) { $ids.Count - 1 } else { $idx - 1 }
+    }
+    else {
+        $idx = if ($idx -ge ($ids.Count - 1)) { 0 } else { $idx + 1 }
+    }
+    return $ids[$idx]
+}
+
 function Format-TimerWatchRow {
     <#
     .SYNOPSIS
@@ -965,7 +1607,8 @@ function Get-TimerWatchNotifyLabel {
 
     $channels = Get-TimerNotifyChannelsFromTimer -Timer $Timer
     $webhookName = if ($Timer.PSObject.Properties.Name -contains 'WebhookName') { $Timer.WebhookName } else { $null }
-    return Format-TimerNotifyLabel -Visual $channels.Visual -Sound $channels.Sound -WebhookName $webhookName
+    $voice = if ($channels.Voice) { $true } else { $false }
+    return Format-TimerNotifyLabel -Visual $channels.Visual -Sound $channels.Sound -WebhookName $webhookName -Voice $voice -CountdownMode $(if ($Timer.PSObject.Properties.Name -contains 'CountdownMode') { $Timer.CountdownMode } else { $null })
 }
 
 function Get-TimerWatchCompletedContent {
@@ -1178,11 +1821,16 @@ function Get-TimerNotificationConfig {
     $channels = Get-TimerNotifyChannelsFromSource -Source $config
 
     return @{
-        Visual    = $channels.Visual
-        Sound     = $channels.Sound
-        Webhook   = if ($config.Webhook) { $config.Webhook } else { $null }
+        Visual      = $channels.Visual
+        Sound       = $channels.Sound
+        Voice       = $channels.Voice
+        Webhook     = if ($config.Webhook) { $config.Webhook } else { $null }
         SoundFile = if ($config.SoundFile) { Resolve-TimerSoundFilePath -Name $config.SoundFile } else { $null }
         Notify    = if ($config.Notify) { $config.Notify } else { $null }
+        VoiceRate = if ($config.VoiceRate -ne $null) { [int]$config.VoiceRate } else { 0 }
+        VoiceName = if ($config.VoiceName) { [string]$config.VoiceName } else { $null }
+        VoiceVolume = if ($config.VoiceVolume -ne $null) { [int]$config.VoiceVolume } else { 100 }
+        Countdown = if ($config.Countdown) { [string]$config.Countdown } else { 'none' }
     }
 }
 
@@ -1196,18 +1844,29 @@ function Resolve-TimerNotificationSettings {
         [string]$VisualOverride = $null,
         $SoundOverride = $null,
         [string]$WebhookOverride = $null,
+        $VoiceOverride = $null,
+        [string]$VoiceNameOverride = $null,
+        [string]$CountdownOverride = $null,
         [string]$PresetNotify = $null,
         [string]$PresetVisual = $null,
         $PresetSound = $null,
-        [string]$PresetWebhook = $null
+        $PresetVoice = $null,
+        [string]$PresetWebhook = $null,
+        [string]$PresetCountdown = $null
     )
 
     $validLegacy = @('popup', 'toast', 'sound', 'silent', 'webhook')
     $validVisual = @('popup', 'toast', 'none')
+    $validCountdown = @('none', '321', '10', 'both')
     $defaults = Get-TimerNotificationConfig
     $visual = $defaults.Visual
     $sound = $defaults.Sound
+    $voice = $defaults.Voice
     $webhookName = $defaults.Webhook
+    $voiceName = $defaults.VoiceName
+    $voiceRate = $defaults.VoiceRate
+    $voiceVolume = $defaults.VoiceVolume
+    $countdown = $defaults.Countdown
     $legacyWebhookOnly = $false
 
     if ($NotifyOverride -and ($validLegacy -contains $NotifyOverride.ToLower())) {
@@ -1234,14 +1893,23 @@ function Resolve-TimerNotificationSettings {
                 $visual = $PresetVisual.ToLower()
             }
             if ($null -ne $PresetSound) { $sound = [bool]$PresetSound }
+            if ($null -ne $PresetVoice) { $voice = [bool]$PresetVoice }
             if ($PresetWebhook) { $webhookName = $PresetWebhook }
+            if ($PresetCountdown -and ($validCountdown -contains $PresetCountdown.ToLower())) {
+                $countdown = $PresetCountdown.ToLower()
+            }
         }
 
         if ($VisualOverride -and ($validVisual -contains $VisualOverride.ToLower())) {
             $visual = $VisualOverride.ToLower()
         }
         if ($null -ne $SoundOverride) { $sound = [bool]$SoundOverride }
+        if ($null -ne $VoiceOverride) { $voice = [bool]$VoiceOverride }
         if ($WebhookOverride) { $webhookName = $WebhookOverride }
+        if ($VoiceNameOverride) { $voiceName = $VoiceNameOverride }
+        if ($CountdownOverride -and ($validCountdown -contains $CountdownOverride.ToLower())) {
+            $countdown = $CountdownOverride.ToLower()
+        }
     }
 
     $webhookUrl = $null
@@ -1257,14 +1925,14 @@ function Resolve-TimerNotificationSettings {
         }
     }
 
-    $label = Format-TimerNotifyLabel -Visual $visual -Sound $sound -WebhookName $webhookName
-    $legacyNotify = if (-not $sound -and $visual -eq 'none' -and -not $webhookUrl) {
+    $label = Format-TimerNotifyLabel -Visual $visual -Sound $sound -WebhookName $webhookName -Voice $voice -CountdownMode $countdown
+    $legacyNotify = if (-not $sound -and -not $voice -and $visual -eq 'none' -and -not $webhookUrl) {
         'silent'
     }
-    elseif (-not $sound -and $visual -eq 'none' -and $webhookUrl) {
+    elseif (-not $sound -and -not $voice -and $visual -eq 'none' -and $webhookUrl) {
         'webhook'
     }
-    elseif ($sound -and $visual -eq 'none' -and -not $webhookUrl) {
+    elseif (($sound -or $voice) -and $visual -eq 'none' -and -not $webhookUrl) {
         'sound'
     }
     else {
@@ -1274,11 +1942,16 @@ function Resolve-TimerNotificationSettings {
     return @{
         Visual      = $visual
         Sound       = $sound
+        Voice       = $voice
         WebhookName = $webhookName
         WebhookUrl  = $webhookUrl
         SoundFile   = $defaults.SoundFile
         Label       = $label
         NotifyType  = $legacyNotify
+        VoiceName   = $voiceName
+        VoiceRate   = $voiceRate
+        VoiceVolume = $voiceVolume
+        Countdown   = $countdown
     }
 }
 
@@ -1332,6 +2005,659 @@ if (`$notifySound) {
 if (`$notifySound) {
     try { [console]::beep(440, 500) } catch { }
 }
+"@
+}
+
+function Get-TimerFireScriptVoiceBlock {
+    <#
+    .SYNOPSIS
+        PowerShell block for TTS in timer fire scripts.
+    #>
+    param(
+        [bool]$Voice = $false,
+        [string]$TextExpr = '$announceText',
+        [string]$VoiceName = $null,
+        [int]$VoiceRate = 0,
+        [int]$VoiceVolume = 100
+    )
+
+    if (-not $Voice) { return '' }
+
+    $voiceNameBlock = if ($VoiceName) {
+        $escaped = $VoiceName -replace "'", "''"
+        "`$s.SelectVoice('$escaped') | Out-Null"
+    } else { '' }
+
+    return @"
+if (`$notifyVoice -and -not [string]::IsNullOrWhiteSpace($TextExpr)) {
+    try {
+        Add-Type -AssemblyName System.Speech
+        `$s = New-Object System.Speech.Synthesis.SpeechSynthesizer
+        $voiceNameBlock
+        `$s.Rate = $VoiceRate
+        `$s.Volume = $VoiceVolume
+        `$s.Speak($TextExpr)
+        `$s.Dispose()
+    } catch {
+        try { [console]::beep(440, 300) } catch { }
+    }
+}
+"@
+}
+
+function Invoke-TimerSpeech {
+    <#
+    .SYNOPSIS
+        Speaks text using Windows TTS (interactive/immediate use).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [string]$VoiceName = $null,
+        [int]$VoiceRate = 0,
+        [int]$VoiceVolume = 100
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { return }
+    if (Test-PS1TimerTestMode) { return }
+
+    try {
+        Add-Type -AssemblyName System.Speech
+        $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
+        if ($VoiceName) { $synth.SelectVoice($VoiceName) | Out-Null }
+        $synth.Rate = $VoiceRate
+        $synth.Volume = $VoiceVolume
+        $synth.Speak($Text)
+        $synth.Dispose()
+    }
+    catch {
+        Write-Warning "PS1Timer: Voice failed: $($_.Exception.Message)"
+        try { [console]::beep(440, 300) } catch { }
+    }
+}
+
+function Get-TimerPhaseAnnounceStartText {
+    param([object]$Phase)
+
+    if (-not $Phase) { return '' }
+    if ($Phase.PSObject.Properties.Name -contains 'AnnounceStart' -and $Phase.AnnounceStart) {
+        return [string]$Phase.AnnounceStart
+    }
+    if ($Phase.Label) {
+        return [string]$Phase.Label
+    }
+    return ''
+}
+
+function Get-SequenceTimerIntroSpeechText {
+    <#
+    .SYNOPSIS
+        Builds the spoken session intro before the first phase clock starts.
+    #>
+    param(
+        [switch]$IsWorkout,
+        [string]$WorkoutRoutine = $null,
+        [object]$FirstPhase,
+        [DateTime]$StartTime,
+        [object]$Summary,
+        [array]$Phases
+    )
+
+    if ($IsWorkout -and $WorkoutRoutine) {
+        $workoutDesc = $WorkoutRoutine
+        $workouts = Get-PS1TimerModuleWorkouts
+        if ($workouts -and $workouts.ContainsKey($WorkoutRoutine) -and $workouts[$WorkoutRoutine].Description) {
+            $workoutDesc = [string]$workouts[$WorkoutRoutine].Description
+        }
+        $finalEndTime = $StartTime.AddSeconds($Summary.TotalSeconds)
+        return Resolve-TimerSpeechText -TemplateKey 'WorkoutStart' -Tokens @{
+            routine     = $WorkoutRoutine
+            description = $workoutDesc
+            duration    = $Summary.TotalDuration
+            endTime     = $finalEndTime.ToString('HH:mm:ss')
+            phaseCount  = [string]$Phases.Count
+        }
+    }
+
+    return Resolve-TimerSpeechText -TemplateKey 'PhaseStart' -Tokens @{ label = $FirstPhase.Label }
+}
+
+function Get-SequenceTimerStartSpeechTexts {
+    <#
+    .SYNOPSIS
+        Builds spoken intro lines for a newly started sequence or workout timer.
+    #>
+    param(
+        [switch]$IsWorkout,
+        [string]$WorkoutRoutine = $null,
+        [object]$FirstPhase,
+        [DateTime]$StartTime,
+        [object]$Summary,
+        [array]$Phases
+    )
+
+    $intro = Get-SequenceTimerIntroSpeechText -IsWorkout:$IsWorkout -WorkoutRoutine $WorkoutRoutine -FirstPhase $FirstPhase -StartTime $StartTime -Summary $Summary -Phases $Phases
+    if ([string]::IsNullOrWhiteSpace($intro)) { return @() }
+    return ,@($intro)
+}
+
+function Invoke-TimerSpeechQueue {
+    param(
+        [Parameter(Mandatory)][string[]]$Texts,
+        [string]$VoiceName = $null,
+        [int]$VoiceRate = 0,
+        [int]$VoiceVolume = 100
+    )
+
+    foreach ($text in $Texts) {
+        Invoke-TimerSpeech -Text $text -VoiceName $VoiceName -VoiceRate $VoiceRate -VoiceVolume $VoiceVolume
+    }
+}
+
+function Write-TimerSpeechQueueScriptFile {
+    <#
+    .SYNOPSIS
+        Writes a short-lived fire-and-forget script for queued TTS (watch/list async start speech).
+    #>
+    param(
+        [Parameter(Mandatory)][string[]]$Texts,
+        [string]$VoiceName = $null,
+        [int]$VoiceRate = 0,
+        [int]$VoiceVolume = 100
+    )
+
+    $queue = @($Texts | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($queue.Count -eq 0) { return $null }
+
+    $scriptId = [Guid]::NewGuid().ToString('N').Substring(0, 8)
+    $scriptPath = Join-Path $env:TEMP "PSTimer_speech_$scriptId.ps1"
+    $escapedScriptPath = $scriptPath -replace "'", "''"
+
+    $voiceNameLine = if ($VoiceName) {
+        $escapedVoice = $VoiceName -replace "'", "''"
+        "`$synth.SelectVoice('$escapedVoice') | Out-Null"
+    } else { '' }
+
+    $speakLines = [System.Collections.Generic.List[string]]::new()
+    foreach ($text in $queue) {
+        $escapedText = ([string]$text) -replace "'", "''"
+        [void]$speakLines.Add("`$synth.Speak('$escapedText')")
+    }
+    if ($speakLines.Count -eq 0) { return $null }
+
+    $content = (Get-TimerTestScriptGuard) + @"
+try {
+    Add-Type -AssemblyName System.Speech
+    `$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
+    $voiceNameLine
+    `$synth.Rate = $VoiceRate
+    `$synth.Volume = $VoiceVolume
+    $($speakLines -join "`n    ")
+    `$synth.Dispose()
+} catch {
+    try { [console]::beep(440, 300) } catch { }
+}
+Remove-Item -LiteralPath '$escapedScriptPath' -Force -ErrorAction SilentlyContinue
+"@
+
+    $utf8Bom = New-Object System.Text.UTF8Encoding $true
+    [System.IO.File]::WriteAllText($scriptPath, $content, $utf8Bom)
+    return $scriptPath
+}
+
+function Invoke-TimerSpeechQueueAsync {
+    <#
+    .SYNOPSIS
+        Speaks queued text in a hidden pwsh process so watch/list UI can render immediately.
+    #>
+    param(
+        [Parameter(Mandatory)][string[]]$Texts,
+        [string]$VoiceName = $null,
+        [int]$VoiceRate = 0,
+        [int]$VoiceVolume = 100
+    )
+
+    $queue = @($Texts | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($queue.Count -eq 0) { return }
+    if (Test-PS1TimerTestMode) { return }
+
+    $scriptPath = Write-TimerSpeechQueueScriptFile -Texts $queue -VoiceName $VoiceName -VoiceRate $VoiceRate -VoiceVolume $VoiceVolume
+    if (-not $scriptPath) { return }
+
+    try {
+        Start-Process -FilePath $script:PS1TimerPwsh -ArgumentList @(
+            '-NoProfile',
+            '-WindowStyle', 'Hidden',
+            '-File', $scriptPath
+        ) -WindowStyle Hidden -ErrorAction Stop | Out-Null
+    }
+    catch {
+        try { [console]::beep(440, 300) } catch { }
+    }
+}
+
+function Get-TimerPhaseDataFromObject {
+    param([object]$Phase)
+
+    $countdown = 'none'
+    if ($Phase.PSObject.Properties.Name -contains 'Countdown' -and $Phase.Countdown) {
+        $countdown = [string]$Phase.Countdown
+    }
+    $announceStart = if ($Phase.PSObject.Properties.Name -contains 'AnnounceStart' -and $Phase.AnnounceStart) {
+        [string]$Phase.AnnounceStart
+    } elseif ($Phase.Label) {
+        [string]$Phase.Label
+    } else { '' }
+
+    return @{
+        Countdown     = $countdown
+        AnnounceStart = $announceStart
+        AnnounceEnd   = if ($Phase.PSObject.Properties.Name -contains 'AnnounceEnd') { $Phase.AnnounceEnd } else { $null }
+        PhaseType     = if ($Phase.PSObject.Properties.Name -contains 'PhaseType') { $Phase.PhaseType } else { $null }
+        ExerciseName  = if ($Phase.PSObject.Properties.Name -contains 'ExerciseName') { $Phase.ExerciseName } else { $null }
+        SetNumber     = if ($Phase.PSObject.Properties.Name -contains 'SetNumber') { $Phase.SetNumber } else { $null }
+        SetTotal      = if ($Phase.PSObject.Properties.Name -contains 'SetTotal') { $Phase.SetTotal } else { $null }
+    }
+}
+
+function New-TimerCueTaskName {
+    param([string]$TimerId)
+    return "PSTimer_${TimerId}_cue_$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
+}
+
+function Write-TimerBeepCueFireScriptFile {
+    param([Parameter(Mandatory)][string]$CueTaskName)
+
+    $scriptPath = Join-Path $env:TEMP "$CueTaskName.ps1"
+    $content = (Get-TimerTestScriptGuard) + @"
+try { [console]::beep(880, 120) } catch { }
+"@
+    $utf8Bom = New-Object System.Text.UTF8Encoding $true
+    [System.IO.File]::WriteAllText($scriptPath, $content, $utf8Bom)
+    return $scriptPath
+}
+
+function Get-TimerBeepAtSeconds {
+    param(
+        [PSCustomObject]$Timer,
+        [object]$Phase = $null
+    )
+
+    if ($Phase -and $Phase.PSObject.Properties.Name -contains 'BeepAt' -and $Phase.BeepAt) {
+        return @($Phase.BeepAt | ForEach-Object { [int]$_ })
+    }
+    if ($Timer.PSObject.Properties.Name -contains 'BeepAt' -and $Timer.BeepAt) {
+        return @($Timer.BeepAt | ForEach-Object { [int]$_ })
+    }
+    return @()
+}
+
+function Test-TimerNeedsPhaseCues {
+    param([PSCustomObject]$Timer)
+
+    if ((Get-TimerBeepAtSeconds -Timer $Timer).Count -gt 0) {
+        return $true
+    }
+    if ((Get-TimerNotifyChannelsFromTimer -Timer $Timer).Voice) {
+        return $true
+    }
+    if ($Timer.IsSequence) {
+        $phaseIndex = if ($Timer.PSObject.Properties.Name -contains 'CurrentPhase') { [int]$Timer.CurrentPhase } else { 0 }
+        $totalPhases = if ($Timer.PSObject.Properties.Name -contains 'TotalPhases') { [int]$Timer.TotalPhases } else { 0 }
+        if ($phaseIndex -lt ($totalPhases - 1)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Save-TimerCueTaskNames {
+    param(
+        [Parameter(Mandatory)][string]$TimerId,
+        [string[]]$CueTaskNames
+    )
+
+    $timers = @(Get-TimerData)
+    $timer = Find-TimerById -Timers $timers -Id $TimerId
+    if (-not $timer) { return }
+
+    $timer | Add-Member -NotePropertyName 'CueTaskNames' -NotePropertyValue @($CueTaskNames) -Force
+    Save-TimerData -Timers $timers
+}
+
+function Write-TimerCueFireScriptFile {
+    param(
+        [Parameter(Mandatory)][string]$CueTaskName,
+        [Parameter(Mandatory)][string]$SpeakText,
+        [string]$VoiceName = $null,
+        [int]$VoiceRate = 0,
+        [int]$VoiceVolume = 100
+    )
+
+    $escapedText = $SpeakText -replace "'", "''"
+    $voiceBlock = Get-TimerFireScriptVoiceBlock -Voice $true -TextExpr "'$escapedText'" -VoiceName $VoiceName -VoiceRate $VoiceRate -VoiceVolume $VoiceVolume
+    $scriptPath = Join-Path $env:TEMP "$CueTaskName.ps1"
+    $content = (Get-TimerTestScriptGuard) + @"
+`$notifyVoice = `$true
+$voiceBlock
+"@
+    $utf8Bom = New-Object System.Text.UTF8Encoding $true
+    [System.IO.File]::WriteAllText($scriptPath, $content, $utf8Bom)
+    return $scriptPath
+}
+
+function Register-TimerCueTask {
+    param(
+        [Parameter(Mandatory)][string]$CueTaskName,
+        [Parameter(Mandatory)][datetime]$TriggerTime,
+        [Parameter(Mandatory)][string]$ScriptPath
+    )
+
+    $vbsPath = Join-Path $env:TEMP "$CueTaskName.vbs"
+    Write-TimerVbsLauncherFile -VbsPath $vbsPath -Ps1Path $ScriptPath
+
+    $null = Register-TimerScheduledTask -TaskName $CueTaskName -TriggerTime $TriggerTime -VbsPath $vbsPath
+    return $CueTaskName
+}
+
+function Unregister-TimerCueTasks {
+    param([PSCustomObject]$Timer)
+
+    $cueNames = [System.Collections.Generic.List[string]]::new()
+    if ($Timer.PSObject.Properties.Name -contains 'CueTaskNames' -and $Timer.CueTaskNames) {
+        foreach ($n in @($Timer.CueTaskNames)) {
+            if (-not [string]::IsNullOrWhiteSpace($n)) { [void]$cueNames.Add($n) }
+        }
+    }
+
+    $id = [string]$Timer.Id
+    $service = $null
+    $folder = $null
+    $tasks = $null
+    try {
+        $service = New-Object -ComObject Schedule.Service
+        $service.Connect()
+        $folder = $service.GetFolder('\')
+        $tasks = $folder.GetTasks(1)
+        for ($i = 1; $i -le $tasks.Count; $i++) {
+            $name = $tasks.Item($i).Name
+            if ($name -like "PSTimer_${id}_cue_*") {
+                [void]$cueNames.Add($name)
+            }
+        }
+    }
+    catch { }
+    finally {
+        if ($tasks) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($tasks) | Out-Null }
+        if ($folder) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($folder) | Out-Null }
+        if ($service) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($service) | Out-Null }
+    }
+
+    $unique = @($cueNames | Select-Object -Unique)
+    if ($unique.Count -gt 0) {
+        Remove-TimerScheduledTasks -Names $unique
+    }
+
+    foreach ($name in $unique) {
+        $ps1 = Join-Path $env:TEMP "$name.ps1"
+        $vbs = Join-Path $env:TEMP "$name.vbs"
+        Remove-Item -LiteralPath $ps1 -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $vbs -Force -ErrorAction SilentlyContinue
+    }
+
+    $Timer | Add-Member -NotePropertyName 'CueTaskNames' -NotePropertyValue @() -Force
+}
+
+function Register-TimerPhaseCueTasks {
+    param(
+        [PSCustomObject]$Timer,
+        [int]$PhaseSeconds,
+        [object]$Phase = $null,
+        [datetime]$PhaseStart = (Get-Date)
+    )
+
+    Unregister-TimerCueTasks -Timer $Timer
+
+    $phaseIndex = if ($Timer.PSObject.Properties.Name -contains 'CurrentPhase') { [int]$Timer.CurrentPhase } else { 0 }
+    $beepAt = @(Get-TimerBeepAtSeconds -Timer $Timer -Phase $Phase)
+    $hasNextPhase = $false
+    if ($Timer.IsSequence) {
+        $totalPhases = if ($Timer.PSObject.Properties.Name -contains 'TotalPhases') { [int]$Timer.TotalPhases } else { @($Timer.Phases).Count }
+        $hasNextPhase = ($phaseIndex -lt ($totalPhases - 1))
+    }
+
+    $channels = Get-TimerNotifyChannelsFromTimer -Timer $Timer
+    $needVoice = $channels.Voice
+    if (-not $needVoice -and $beepAt.Count -eq 0 -and -not $hasNextPhase) {
+        return @()
+    }
+
+    $phaseData = if ($Phase) {
+        Get-TimerPhaseDataFromObject -Phase $Phase
+    }
+    else {
+        @{
+            Countdown     = if ($Timer.PSObject.Properties.Name -contains 'CountdownMode' -and $Timer.CountdownMode) { [string]$Timer.CountdownMode } else { 'none' }
+            AnnounceStart = if ($Timer.Message) { [string]$Timer.Message } else { '' }
+        }
+    }
+
+    $countdown = if ($needVoice) { $phaseData.Countdown } else { 'none' }
+    $startText = if ($needVoice) { $phaseData.AnnounceStart } else { $null }
+
+    # Phase transitions speak the next label at phase end; skip start cues to avoid duplicates.
+    # Workout phase 0 first exercise is spoken synchronously at workout start.
+    $includePhaseStart = $false
+
+    $cues = @(Get-TimerPhaseCueSchedule -PhaseSeconds $PhaseSeconds `
+        -CountdownMode $countdown `
+        -PhaseStartText $startText `
+        -IncludePhaseStartAtZero:$includePhaseStart `
+        -BeepAtSeconds $beepAt `
+        -IncludeEndBeep321:$hasNextPhase)
+
+    if ($cues.Count -eq 0) { return @() }
+
+    $phaseEnd = if ($Timer.EndTime) { [DateTime]::Parse($Timer.EndTime) } else { $PhaseStart.AddSeconds($PhaseSeconds) }
+    $voiceName = if ($Timer.PSObject.Properties.Name -contains 'VoiceName') { $Timer.VoiceName } else { $null }
+    $voiceRate = if ($Timer.PSObject.Properties.Name -contains 'VoiceRate') { [int]$Timer.VoiceRate } else { 0 }
+    $voiceVolume = if ($Timer.PSObject.Properties.Name -contains 'VoiceVolume') { [int]$Timer.VoiceVolume } else { 100 }
+
+    $cueNames = [System.Collections.Generic.List[string]]::new()
+    foreach ($cue in $cues) {
+        $trig = $phaseEnd.AddSeconds(-[int]$cue.OffsetFromEnd)
+        if ($trig -le (Get-Date)) { continue }
+        $cueTask = New-TimerCueTaskName -TimerId $Timer.Id
+        if ($cue.CueType -eq 'beep') {
+            $scriptPath = Write-TimerBeepCueFireScriptFile -CueTaskName $cueTask
+        }
+        else {
+            $scriptPath = Write-TimerCueFireScriptFile -CueTaskName $cueTask -SpeakText $cue.Text -VoiceName $voiceName -VoiceRate $voiceRate -VoiceVolume $voiceVolume
+        }
+        $null = Register-TimerCueTask -CueTaskName $cueTask -TriggerTime $trig -ScriptPath $scriptPath
+        [void]$cueNames.Add($cueTask)
+    }
+
+    $Timer | Add-Member -NotePropertyName 'CueTaskNames' -NotePropertyValue @($cueNames) -Force
+    Save-TimerCueTaskNames -TimerId $Timer.Id -CueTaskNames @($cueNames)
+
+    Write-TimerCueRegistrarFile -TimerId $Timer.Id -VoiceName $voiceName -VoiceRate $voiceRate -VoiceVolume $voiceVolume | Out-Null
+
+    return @($cueNames)
+}
+
+function Write-TimerCueRegistrarFile {
+    param(
+        [Parameter(Mandatory)][string]$TimerId,
+        [string]$VoiceName = $null,
+        [int]$VoiceRate = 0,
+        [int]$VoiceVolume = 100
+    )
+
+    $path = Join-Path $env:TEMP "PSTimer_${TimerId}_register_cues.ps1"
+    $voiceNameLine = if ($VoiceName) {
+        $escaped = $VoiceName -replace "'", "''"
+        "`$synth.SelectVoice('$escaped') | Out-Null"
+    } else { '' }
+    $escapedPwsh = $script:PS1TimerPwsh -replace "'", "''"
+
+    $content = @"
+param([Parameter(Mandatory)][int]`$PhaseIndex)
+
+$(Get-TimerEmbeddedDataFileIoScript)
+
+`$dataFile = Join-Path `$env:TEMP 'ps-timers.json'
+`$timerId = '$TimerId'
+if (-not (Test-Path -LiteralPath `$dataFile)) { exit }
+`$parsed = Get-Content -LiteralPath `$dataFile -Raw | ConvertFrom-Json
+`$timers = if (`$parsed -is [array]) { @(`$parsed) } else { @(`$parsed) }
+`$timer = `$timers | Where-Object { [string]`$_.Id -eq `$timerId } | Select-Object -First 1
+if (-not `$timer) { exit }
+
+`$existing = @()
+if (`$timer.CueTaskNames) { `$existing = @(`$timer.CueTaskNames) }
+foreach (`$cn in `$existing) {
+    Unregister-ScheduledTask -TaskName `$cn -Confirm:`$false -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path `$env:TEMP "`$cn.ps1") -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path `$env:TEMP "`$cn.vbs") -Force -ErrorAction SilentlyContinue
+}
+
+`$isSequence = [bool]`$timer.IsSequence
+`$phase = `$null
+`$seconds = [int]`$timer.Seconds
+if (`$isSequence) {
+    `$phases = @(`$timer.Phases)
+    if (`$PhaseIndex -lt 0 -or `$PhaseIndex -ge `$phases.Count) { exit }
+    `$phase = `$phases[`$PhaseIndex]
+    `$seconds = [int]`$phase.Seconds
+}
+
+`$hasNextPhase = `$false
+if (`$isSequence) {
+    `$hasNextPhase = (`$PhaseIndex -lt (@(`$timer.Phases).Count - 1))
+}
+
+`$beepAt = @()
+if (`$timer.BeepAt) { `$beepAt = @(`$timer.BeepAt | ForEach-Object { [int]`$_ }) }
+if (`$phase -and `$phase.BeepAt) { `$beepAt = @(`$phase.BeepAt | ForEach-Object { [int]`$_ }) }
+
+`$needVoice = [bool]`$timer.NotifyVoice
+if (-not `$needVoice -and `$beepAt.Count -eq 0 -and -not `$hasNextPhase) {
+    `$timer.CueTaskNames = @()
+    Write-TimerDataFileAtomic -DataFile `$dataFile -Content (ConvertTo-Json -InputObject `$timers -Depth 12)
+    exit
+}
+
+`$phaseEnd = if (`$timer.EndTime) { [DateTime]::Parse(`$timer.EndTime) } else { (Get-Date).AddSeconds(`$seconds) }
+`$remaining = [int](`$phaseEnd - (Get-Date)).TotalSeconds
+if (`$remaining -gt 0 -and `$remaining -lt `$seconds) { `$seconds = `$remaining }
+if (`$seconds -le 0) { exit }
+
+`$countdown = 'none'
+if (`$needVoice) {
+    `$countdown = if (`$timer.CountdownMode) { [string]`$timer.CountdownMode } else { 'none' }
+    if (`$phase -and `$phase.Countdown) { `$countdown = [string]`$phase.Countdown }
+}
+
+`$cueList = @()
+if (`$countdown -eq 'both') { `$modes = @('10','321') } elseif (`$countdown -ne 'none') { `$modes = @(`$countdown) } else { `$modes = @() }
+foreach (`$mode in `$modes) {
+    if (`$mode -eq '10' -and `$seconds -ge 10) { `$cueList += [PSCustomObject]@{ OffsetFromEnd = 10; Text = '10'; CueType = 'countdown' } }
+    if (`$mode -eq '321') {
+        `$maxTick = [Math]::Min(3, `$seconds)
+        for (`$ci = `$maxTick; `$ci -ge 1; `$ci--) { `$cueList += [PSCustomObject]@{ OffsetFromEnd = `$ci; Text = [string]`$ci; CueType = 'countdown' } }
+    }
+}
+
+`$beepOffsets = [System.Collections.Generic.HashSet[int]]::new()
+foreach (`$offset in `$beepAt) {
+    if (`$offset -gt 0 -and `$offset -le `$seconds) { [void]`$beepOffsets.Add([int]`$offset) }
+}
+if (`$hasNextPhase) {
+    `$maxTick = [Math]::Min(3, `$seconds)
+    for (`$ci = `$maxTick; `$ci -ge 1; `$ci--) { [void]`$beepOffsets.Add(`$ci) }
+}
+foreach (`$offset in (`$beepOffsets | Sort-Object -Descending)) {
+    `$cueList += [PSCustomObject]@{ OffsetFromEnd = `$offset; Text = `$null; CueType = 'beep' }
+}
+
+`$newCueNames = @()
+foreach (`$cue in (`$cueList | Sort-Object -Property OffsetFromEnd -Descending)) {
+    `$trig = `$phaseEnd.AddSeconds(-[int]`$cue.OffsetFromEnd)
+    if (`$trig -le (Get-Date)) { continue }
+    `$cueTask = "PSTimer_`$timerId`_cue_`$([Guid]::NewGuid().ToString('N').Substring(0,8))"
+    `$cuePs1 = Join-Path `$env:TEMP "`$cueTask.ps1"
+    if (`$cue.CueType -eq 'beep') {
+        `$cueBody = 'try { [console]::beep(880, 120) } catch { }'
+    } else {
+        `$escapedSpeak = (`$cue.Text -replace "'", "''")
+        `$cueLines = @(
+            '`$notifyVoice = `$true',
+            'try {',
+            '    Add-Type -AssemblyName System.Speech',
+            '    `$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer',
+            'VOICE_NAME_LINE',
+            '    `$synth.Rate = VOICE_RATE',
+            '    `$synth.Volume = VOICE_VOLUME',
+            '    `$synth.Speak(''SPEAK_TEXT'')',
+            '    `$synth.Dispose()',
+            '} catch { try { [console]::beep(440,300) } catch {} }'
+        )
+        `$cueBody = (`$cueLines -join [char]10) -replace 'VOICE_NAME_LINE', '$voiceNameLine' -replace 'VOICE_RATE', '$VoiceRate' -replace 'VOICE_VOLUME', '$VoiceVolume' -replace 'SPEAK_TEXT', `$escapedSpeak
+    }
+    `$utf8 = New-Object System.Text.UTF8Encoding `$true
+    [System.IO.File]::WriteAllText(`$cuePs1, `$cueBody, `$utf8)
+    `$cueVbs = Join-Path `$env:TEMP "`$cueTask.vbs"
+    `$pwshPath = '$escapedPwsh'
+    `$ps1Esc = `$cuePs1.Replace('"', '""')
+    `$pwshEsc = `$pwshPath.Replace('"', '""')
+    `$vbsArgs = ' -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File '
+    `$vbsContent = (
+        'Set WshShell = CreateObject("WScript.Shell")' + [char]13 + [char]10 +
+        'WshShell.Run Chr(34) & "' + `$pwshEsc + '" & Chr(34) & "' + `$vbsArgs + '" & Chr(34) & "' + `$ps1Esc + '" & Chr(34), 0, False' + [char]13 + [char]10 +
+        'Set WshShell = Nothing'
+    )
+    [System.IO.File]::WriteAllText(`$cueVbs, `$vbsContent, [System.Text.Encoding]::ASCII)
+    `$action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"`$cueVbs`""
+    `$trigger = New-ScheduledTaskTrigger -Once -At `$trig
+    `$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -Hidden
+    try {
+        Register-ScheduledTask -TaskName `$cueTask -Action `$action -Trigger `$trigger -Settings `$settings -Force -ErrorAction Stop | Out-Null
+        `$newCueNames += `$cueTask
+    } catch { }
+}
+
+`$timer.CueTaskNames = `$newCueNames
+Write-TimerDataFileAtomic -DataFile `$dataFile -Content (ConvertTo-Json -InputObject `$timers -Depth 12)
+"@
+
+    $utf8Bom = New-Object System.Text.UTF8Encoding $true
+    [System.IO.File]::WriteAllText($path, $content, $utf8Bom)
+    return $path
+}
+
+function Invoke-TimerPhaseCueRegistration {
+    param(
+        [Parameter(Mandatory)][string]$TimerId,
+        [Parameter(Mandatory)][int]$PhaseIndex,
+        [string]$VoiceName = $null,
+        [int]$VoiceRate = 0,
+        [int]$VoiceVolume = 100
+    )
+
+    $registrar = Write-TimerCueRegistrarFile -TimerId $TimerId -VoiceName $VoiceName -VoiceRate $VoiceRate -VoiceVolume $VoiceVolume
+    & $script:PS1TimerPwsh -NoProfile -WindowStyle Hidden -File $registrar -PhaseIndex $PhaseIndex | Out-Null
+}
+
+function Get-TimerFireScriptRegisterCuesBlock {
+    param([string]$TimerId)
+
+    $registrar = Join-Path $env:TEMP "PSTimer_${TimerId}_register_cues.ps1"
+    $escaped = $registrar -replace "'", "''"
+    return @"
+            `$registrar = '$escaped'
+            if (Test-Path -LiteralPath `$registrar) {
+                & '$($script:PS1TimerPwsh -replace "'", "''")' -NoProfile -WindowStyle Hidden -File `$registrar -PhaseIndex `$nextPhaseIdx
+            }
 "@
 }
 
@@ -1505,6 +2831,8 @@ function Invoke-TimerAfterStart {
         [string]$AfterStart = $null
     )
 
+    if (Test-PS1TimerTestMode) { return }
+
     switch (Get-TimerAfterStartAction -Override $AfterStart) {
         'watch' { Timer-Watch -Id $TimerId }
         'list'  { Timer-List -Watch }
@@ -1542,6 +2870,8 @@ function Show-TimerNotification {
     }
     if (-not $Visual) { $Visual = 'popup' }
 
+    if (Test-PS1TimerTestMode) { return }
+
     if ($Sound) {
         $soundType = if ($Visual -eq 'none') { 'sound' } else { $Visual }
         Play-TimerSound -Type $soundType -SoundFile $SoundFile
@@ -1569,7 +2899,9 @@ function Show-TimerPopup {
         
         [array]$Body = @()
     )
-    
+
+    if (Test-PS1TimerTestMode) { return }
+
     $popup = New-Object -ComObject WScript.Shell
     $text = $Body -join [char]10
     if ([string]::IsNullOrEmpty($text)) {
@@ -1600,7 +2932,9 @@ function Show-TimerToast {
         
         [array]$Body = @()
     )
-    
+
+    if (Test-PS1TimerTestMode) { return }
+
     try {
         # Load Windows Forms assembly
         Add-Type -AssemblyName System.Windows.Forms | Out-Null
@@ -1659,6 +2993,8 @@ function Play-TimerSound {
         [string]$Type = 'popup',
         [string]$SoundFile = $null
     )
+
+    if (Test-PS1TimerTestMode) { return }
     
     if ($SoundFile -and (Test-Path -LiteralPath $SoundFile)) {
         # Play custom sound file
@@ -1767,17 +3103,27 @@ function Write-TimerFireScriptFile {
     )
     $scriptPath = Join-Path $env:TEMP "PSTimer_$TimerId.ps1"
     $utf8Bom = New-Object System.Text.UTF8Encoding $true
-    [System.IO.File]::WriteAllText($scriptPath, $ScriptBody, $utf8Bom)
+    $content = (Get-TimerTestScriptGuard) + $ScriptBody
+    [System.IO.File]::WriteAllText($scriptPath, $content, $utf8Bom)
     return $scriptPath
+}
+
+function Write-TimerVbsLauncherFile {
+    param(
+        [Parameter(Mandatory)][string]$VbsPath,
+        [Parameter(Mandatory)][string]$Ps1Path
+    )
+
+    $vbsScript = Get-TimerVbsWrapperScript -Ps1Path $Ps1Path
+    $vbsScript | Set-Content -LiteralPath $VbsPath -Force -Encoding Ascii
+    return $VbsPath
 }
 
 function Write-TimerVbsWrapperFile {
     param([Parameter(Mandatory)][string]$TimerId)
     $scriptPath = Join-Path $env:TEMP "PSTimer_$TimerId.ps1"
     $vbsPath = Join-Path $env:TEMP "PSTimer_$TimerId.vbs"
-    $vbsScript = Get-TimerVbsWrapperScript -Ps1Path $scriptPath
-    $vbsScript | Set-Content -LiteralPath $vbsPath -Force -Encoding Ascii
-    return $vbsPath
+    return Write-TimerVbsLauncherFile -VbsPath $vbsPath -Ps1Path $scriptPath
 }
 
 function Register-TimerScheduledTask {
@@ -1787,6 +3133,8 @@ function Register-TimerScheduledTask {
         [Parameter(Mandatory)][string]$VbsPath,
         [string]$TimerId = $null
     )
+
+    if (Test-PS1TimerTestMode) { return $true }
 
     Remove-TimerScheduledTaskByName -TaskName $TaskName
 
@@ -1845,6 +3193,57 @@ function Register-TimerScheduledTaskAsync {
 
     $null = Start-Job -Name "PSTimerReg_$TaskName" -ScriptBlock {
         param($tn, $trig, $vbs, $tid, $dataFile)
+        $embeddedIo = @'
+function Write-TimerDataFileAtomic {
+    param(
+        [Parameter(Mandatory)][string]$DataFile,
+        [Parameter(Mandatory)][string]$Content
+    )
+    $mutexName = 'Global\PS1Timer_ps-timers_json'
+    $utf8Bom = [System.Text.UTF8Encoding]::new($true)
+    $attempt = 0
+    while ($attempt -lt 8) {
+        $attempt++
+        $mutex = $null
+        $acquired = $false
+        try {
+            $mutex = [System.Threading.Mutex]::new($false, $mutexName)
+            $acquired = $mutex.WaitOne(8000)
+            if (-not $acquired) {
+                throw [System.IO.IOException]::new('Timed out waiting for timer data file lock.')
+            }
+            $tmpPath = "$DataFile.$([Guid]::NewGuid().ToString('N')).tmp"
+            try {
+                [System.IO.File]::WriteAllText($tmpPath, $Content, $utf8Bom)
+                [System.IO.File]::Move($tmpPath, $DataFile, $true)
+            }
+            finally {
+                if (Test-Path -LiteralPath $tmpPath) {
+                    Remove-Item -LiteralPath $tmpPath -Force -ErrorAction SilentlyContinue
+                }
+            }
+            return
+        }
+        catch [System.IO.IOException] {
+            if ($attempt -ge 8) { throw }
+            Start-Sleep -Milliseconds (50 * $attempt)
+        }
+        catch [System.UnauthorizedAccessException] {
+            if ($attempt -ge 8) { throw }
+            Start-Sleep -Milliseconds (50 * $attempt)
+        }
+        finally {
+            if ($mutex) {
+                if ($acquired) {
+                    try { $mutex.ReleaseMutex() } catch { }
+                }
+                $mutex.Dispose()
+            }
+        }
+    }
+}
+'@
+        Invoke-Expression $embeddedIo
         $action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$vbs`""
         $triggerObj = New-ScheduledTaskTrigger -Once -At $trig
         $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -Hidden
@@ -1871,8 +3270,7 @@ function Register-TimerScheduledTaskAsync {
                         $t.TaskName = $null
                         break
                     }
-                    $utf8Bom = New-Object System.Text.UTF8Encoding $true
-                    [System.IO.File]::WriteAllText($dataFile, (ConvertTo-Json -InputObject $list -Depth 10), $utf8Bom)
+                    Write-TimerDataFileAtomic -DataFile $dataFile -Content (ConvertTo-Json -InputObject $list -Depth 12)
                 }
                 catch { }
             }
@@ -1934,6 +3332,7 @@ function Start-TimerJob {
 `$currentRun = $($Timer.CurrentRun)
 `$timerSeconds = $($Timer.Seconds)
 `$dataFile = '$dataFile'
+$(Get-TimerEmbeddedDataFileIoScript)
 `$logFile = "`$env:TEMP\PSTimer_`$timerId.log"
 `$notifyVisual = '$Visual'
 `$notifySound = $notifySoundLiteral
@@ -1941,9 +3340,7 @@ function Start-TimerJob {
 `$currentTaskName = '$taskName'
 
 try {
-$soundBlock
-
-    # Update timer data FIRST (before popup, so tl shows correct state)
+    # Update timer data FIRST (before sound/popup, so tl/watch stay in sync)
     if (Test-Path -LiteralPath `$dataFile) {
         `$jsonContent = Get-Content -LiteralPath `$dataFile -Raw -ErrorAction Stop
         `$parsed = `$jsonContent | ConvertFrom-Json
@@ -1975,7 +3372,7 @@ $soundBlock
                 `$newCurrentRun = [int]`$timer.RepeatTotal - `$newRepeatRemaining
                 `$newStart = (Get-Date).ToString('o')
                 `$newEnd = (Get-Date).AddSeconds(`$timerSeconds).ToString('o')
-                `$nextTaskName = "PSTimer_`$timerId_`$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
+                `$nextTaskName = "PSTimer_`${timerId}_`$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
 
                 # Create updated timer object
                 `$updatedTimer = [PSCustomObject]@{
@@ -1992,10 +3389,11 @@ $soundBlock
                     RemainingSeconds = `$null
                     TaskName        = `$nextTaskName
                 }
+$(Get-TimerFireScriptPreserveNotifyFieldsBlock)
                 `$timers[`$timerIndex] = `$updatedTimer
 
                 # Save BEFORE scheduling next task
-                ConvertTo-Json -InputObject `$timers -Depth 10 | Set-Content -LiteralPath `$dataFile -Force
+                Write-TimerDataFileAtomic -DataFile `$dataFile -Content (ConvertTo-Json -InputObject `$timers -Depth 12)
 
                 # Schedule next run (completely hidden - uses existing VBS wrapper)
                 `$nextTrigger = (Get-Date).AddSeconds(`$timerSeconds)
@@ -2034,15 +3432,17 @@ $soundBlock
                     RemainingSeconds = `$null
                     TaskName        = `$null
                 }
+$(Get-TimerFireScriptPreserveNotifyFieldsBlock)
                 `$timers[`$timerIndex] = `$updatedTimer
 
-                ConvertTo-Json -InputObject `$timers -Depth 10 | Set-Content -LiteralPath `$dataFile -Force
+                Write-TimerDataFileAtomic -DataFile `$dataFile -Content (ConvertTo-Json -InputObject `$timers -Depth 12)
 
                 Unregister-ScheduledTask -TaskName `$currentTaskName -Confirm:`$false -ErrorAction SilentlyContinue
                 Remove-Item -LiteralPath "`$env:TEMP\PSTimer_`$timerId.ps1" -Force -ErrorAction SilentlyContinue
             }
         }
     }
+$soundBlock
 } catch {
     "`$(Get-Date -Format 'o') ERROR: `$(`$_.Exception.Message)" | Add-Content -LiteralPath `$logFile -Force
 }
@@ -2062,6 +3462,10 @@ $historyBlock
 
     Register-TimerScheduledTaskAsync -TimerId $Timer.Id -TaskName $taskName -TriggerTime $triggerTime -VbsPath $vbsPath
     $Timer | Add-Member -NotePropertyName 'TaskName' -NotePropertyValue $taskName -Force
+
+    if (Test-TimerNeedsPhaseCues -Timer $Timer) {
+        Register-TimerPhaseCueTasks -Timer $Timer -PhaseSeconds $Timer.Seconds
+    }
 }
 
 function Clear-TimerScheduledTaskNameCache {
@@ -2073,45 +3477,59 @@ function Get-PSTimerScheduledTaskNames {
     <#
     .SYNOPSIS
         Returns cached set of existing PSTimer_* scheduled task names (one COM enumeration per TTL).
+        Returns $null when the Task Scheduler lookup fails (callers must not treat as "no tasks").
     #>
     param([switch]$ForceRefresh)
 
+    if ($global:TimerTestScheduledTaskNamesUseResultOverride) {
+        return ,$global:TimerTestScheduledTaskNamesResultOverride
+    }
+
+    if ($null -ne $global:TimerTestGetPSTimerScheduledTaskNamesOverride) {
+        return & $global:TimerTestGetPSTimerScheduledTaskNamesOverride
+    }
+
     $now = Get-Date
     if (-not $ForceRefresh -and $null -ne $script:TimerTaskNameCache -and ($now - $script:TimerTaskNameCacheTime).TotalSeconds -lt $script:TimerTaskNameCacheTtlSeconds) {
-        return $script:TimerTaskNameCache
+        return ,$script:TimerTaskNameCache
     }
 
-    $names = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    $service = $null
-    $folder = $null
-    $tasks = $null
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        $names = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $service = $null
+        $folder = $null
+        $tasks = $null
 
-    try {
-        $service = New-Object -ComObject Schedule.Service
-        $service.Connect()
-        $folder = $service.GetFolder('\')
-        $tasks = $folder.GetTasks(1)
+        try {
+            $service = New-Object -ComObject Schedule.Service
+            $service.Connect()
+            $folder = $service.GetFolder('\')
+            $tasks = $folder.GetTasks(1)
 
-        for ($i = 1; $i -le $tasks.Count; $i++) {
-            $name = $tasks.Item($i).Name
-            if ($name -like 'PSTimer_*') {
-                [void]$names.Add($name)
+            for ($i = 1; $i -le $tasks.Count; $i++) {
+                $name = $tasks.Item($i).Name
+                if ($name -like 'PSTimer_*') {
+                    [void]$names.Add($name)
+                }
             }
         }
-    }
-    catch {
-        Write-Warning "PS1Timer: Could not list scheduled tasks: $($_.Exception.Message)"
-        return $names
-    }
-    finally {
-        if ($tasks) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($tasks) | Out-Null }
-        if ($folder) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($folder) | Out-Null }
-        if ($service) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($service) | Out-Null }
-    }
+        catch {
+            Write-Warning "PS1Timer: Could not list scheduled tasks (attempt $attempt): $($_.Exception.Message)"
+            if ($attempt -lt 2) { continue }
+            return $null
+        }
+        finally {
+            if ($tasks) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($tasks) | Out-Null }
+            if ($folder) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($folder) | Out-Null }
+            if ($service) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($service) | Out-Null }
+        }
 
     $script:TimerTaskNameCache = $names
     $script:TimerTaskNameCacheTime = $now
-    return $names
+    return ,$names
+}
+
+    return $null
 }
 
 function Remove-TimerScheduledTaskByName {
@@ -2385,6 +3803,7 @@ function Invoke-PauseSingleTimer {
     $timer = Find-TimerById -Timers $Timers -Id $Id
     if (-not $timer) { return $false }
     if ($timer.State -ne 'Running') { return $null }
+    Unregister-TimerCueTasks -Timer $timer
     Stop-TimerTask -TimerId $Id -TaskName (Get-TimerTaskName -Timer $timer)
     $endTime = [DateTime]::Parse($timer.EndTime)
     $remaining = [int]($endTime - (Get-Date)).TotalSeconds
@@ -2393,6 +3812,22 @@ function Invoke-PauseSingleTimer {
     $timer.State = 'Paused'
     Save-TimerData -Timers $Timers
     return $remaining
+}
+
+function Invoke-RegisterTimerResumeCues {
+    param([PSCustomObject]$Timer)
+
+    if (-not (Test-TimerNeedsPhaseCues -Timer $Timer)) { return }
+
+    $seconds = [int](Get-TimerResumeSeconds -Timer $Timer)
+    $phaseObj = $null
+    if ($Timer.IsSequence -and $Timer.Phases) {
+        $phaseIndex = if ($Timer.PSObject.Properties.Name -contains 'CurrentPhase') { [int]$Timer.CurrentPhase } else { 0 }
+        if ($Timer.Phases.Count -gt $phaseIndex) {
+            $phaseObj = $Timer.Phases[$phaseIndex]
+        }
+    }
+    Register-TimerPhaseCueTasks -Timer $Timer -PhaseSeconds $seconds -Phase $phaseObj
 }
 
 function Invoke-ResumeTimersBulk {
@@ -2412,6 +3847,7 @@ function Invoke-ResumeTimersBulk {
         $t | Add-Member -NotePropertyName 'RemainingSeconds' -NotePropertyValue $null -Force
         $t | Add-Member -NotePropertyName 'TaskName' -NotePropertyValue (New-TimerTaskName -TimerId $t.Id) -Force
         Start-TimerScheduledJob -Timer $t
+        Invoke-RegisterTimerResumeCues -Timer $t
         $count++
     }
     Save-TimerData -Timers $Timers
@@ -2438,6 +3874,7 @@ function Invoke-ResumeSingleTimer {
     $timer | Add-Member -NotePropertyName 'RemainingSeconds' -NotePropertyValue $null -Force
     $timer | Add-Member -NotePropertyName 'TaskName' -NotePropertyValue (New-TimerTaskName -TimerId $timer.Id) -Force
     Start-TimerScheduledJob -Timer $timer
+    Invoke-RegisterTimerResumeCues -Timer $timer
     Save-TimerData -Timers $Timers
     return @{ Found = $true; CanResume = $true; IsLost = $isLost; NewEndTime = $newEndTime }
 }
@@ -2477,6 +3914,7 @@ function Invoke-RemoveSingleTimer {
     param([array]$Timers, [string]$Id)
     $timer = Find-TimerById -Timers $Timers -Id $Id
     if (-not $timer) { return $false }
+    Unregister-TimerCueTasks -Timer $timer
     Stop-TimerTask -TimerId $Id -TaskName (Get-TimerTaskName -Timer $timer)
     $newList = @($Timers | Where-Object { $_.Id -ne $Id })
     Save-TimerData -Timers $newList
@@ -2515,6 +3953,10 @@ function Test-TimerSequence {
 
     # Check for preset name first
     if ($script:TimerPresets.Keys -contains $Pattern) {
+        $preset = $script:TimerPresets[$Pattern]
+        if (Test-TimerSimpleRepeatingPreset -Preset $preset) {
+            return $false
+        }
         return $true
     }
 
@@ -2608,6 +4050,18 @@ function ConvertFrom-TimerSequence {
             continue
         }
 
+        # Parameter flag (-BeepAt, etc.)
+        if ($char -eq '-' -and $i + 1 -lt $len -and $Pattern[$i + 1] -match '[a-zA-Z]') {
+            $word = '-'
+            $i++
+            while ($i -lt $len -and $Pattern[$i] -match '[a-zA-Z0-9_-]') {
+                $word += $Pattern[$i]
+                $i++
+            }
+            $tokens += @{ Type = 'LABEL'; Value = $word }
+            continue
+        }
+
         # Word (unquoted label)
         if ($char -match '[a-zA-Z]') {
             $word = ''
@@ -2628,6 +4082,10 @@ function ConvertFrom-TimerSequence {
 
     # Expand AST into flat phase list
     $phases = Expand-TimerSequence -Ast $ast
+
+    if ($phases.Count -gt $script:MaxSequencePhases) {
+        throw "Pattern expands to $($phases.Count) phases; maximum is $($script:MaxSequencePhases). Use a repeating simple timer instead (e.g. t 45m message -Repeat 100)."
+    }
 
     return $phases
 }
@@ -2686,12 +4144,43 @@ function ParseSequence {
                 $Index.Value++
             }
 
-            $items += @{
-                Type    = 'PHASE'
-                Seconds = $seconds
-                Label   = $label
+            $beepAt = @()
+            if ($Index.Value -lt $Tokens.Count -and $Tokens[$Index.Value].Type -eq 'LABEL' -and $Tokens[$Index.Value].Value -match '^-?BeepAt$') {
+                $Index.Value++
+                while ($Index.Value -lt $Tokens.Count) {
+                    $beepToken = $Tokens[$Index.Value]
+                    if ($beepToken.Type -eq 'COMMA') {
+                        $nextIdx = $Index.Value + 1
+                        if ($nextIdx -lt $Tokens.Count -and $Tokens[$nextIdx].Type -eq 'DURATION') {
+                            $afterDur = $nextIdx + 1
+                            if ($afterDur -lt $Tokens.Count -and $Tokens[$afterDur].Type -eq 'LABEL') {
+                                break
+                            }
+                        }
+                        $Index.Value++
+                        continue
+                    }
+                    if ($beepToken.Type -eq 'DURATION') {
+                        $beepSeconds = ConvertTo-Seconds -Time $beepToken.Value
+                        if ($beepSeconds -gt 0) { $beepAt += [int]$beepSeconds }
+                        $Index.Value++
+                        continue
+                    }
+                    break
+                }
+                $beepAt = @($beepAt | Sort-Object -Descending -Unique)
+            }
+
+            $phaseItem = @{
+                Type     = 'PHASE'
+                Seconds  = $seconds
+                Label    = $label
                 Duration = $token.Value
             }
+            if ($beepAt.Count -gt 0) {
+                $phaseItem['BeepAt'] = $beepAt
+            }
+            $items += $phaseItem
         }
         else {
             # Skip unknown
@@ -2719,7 +4208,7 @@ function Expand-TimerSequence {
 
     foreach ($item in $Ast) {
         if ($item.Type -eq 'PHASE') {
-            $phases += [PSCustomObject]@{
+            $phaseObj = [PSCustomObject]@{
                 Seconds       = $item.Seconds
                 Label         = $item.Label
                 Duration      = $item.Duration
@@ -2727,6 +4216,10 @@ function Expand-TimerSequence {
                 LoopIteration = $ParentIteration
                 LoopTotal     = $ParentTotal
             }
+            if ($item.BeepAt) {
+                $phaseObj | Add-Member -NotePropertyName 'BeepAt' -NotePropertyValue @($item.BeepAt) -Force
+            }
+            $phases += $phaseObj
         }
         elseif ($item.Type -eq 'GROUP') {
             $groupCounter++
@@ -2795,14 +4288,22 @@ function New-SequenceTimerFromPhases {
         [DateTime]$Now,
         [string]$NotifyVisual = 'popup',
         $NotifySound = $true,
+        $NotifyVoice = $false,
         [string]$NotifyType = $null,
-        [string]$WebhookName = $null
+        [string]$WebhookName = $null,
+        [string]$VoiceName = $null,
+        [int]$VoiceRate = 0,
+        [int]$VoiceVolume = 100,
+        [string]$CountdownMode = 'none',
+        [switch]$IsWorkout,
+        [string]$WorkoutRoutine = $null,
+        [int[]]$BeepAt = @()
     )
     $firstPhase = $Phases[0]
     $endTime = $Now.AddSeconds($firstPhase.Seconds)
     $phasesData = @()
     foreach ($p in $Phases) {
-        $phasesData += @{
+        $entry = @{
             Seconds       = $p.Seconds
             Label         = $p.Label
             Duration      = $p.Duration
@@ -2810,6 +4311,12 @@ function New-SequenceTimerFromPhases {
             LoopIteration = $p.LoopIteration
             LoopTotal     = $p.LoopTotal
         }
+        foreach ($key in @('PhaseType', 'ExerciseName', 'SetNumber', 'SetTotal', 'AnnounceStart', 'AnnounceEnd', 'Countdown', 'NotifyVoice', 'NotifySound', 'SoundFile', 'BeepAt')) {
+            if ($p.PSObject.Properties.Name -contains $key -and $null -ne $p.$key) {
+                $entry[$key] = $p.$key
+            }
+        }
+        $phasesData += $entry
     }
     $phaseCount = $Phases.Count
     $totalSecs = $Summary.TotalSeconds
@@ -2833,9 +4340,20 @@ function New-SequenceTimerFromPhases {
         TotalSeconds    = $totalSecs
         NotifyVisual    = $NotifyVisual
         NotifySound     = $NotifySound
+        NotifyVoice     = [bool]$NotifyVoice
         NotifyType      = $NotifyType
         WebhookName     = $WebhookName
+        VoiceName       = $VoiceName
+        VoiceRate       = $VoiceRate
+        VoiceVolume     = $VoiceVolume
+        CountdownMode   = $CountdownMode
+        CueTaskNames    = @()
+        IsWorkout       = [bool]$IsWorkout
+        WorkoutRoutine  = $WorkoutRoutine
         TaskName        = New-TimerTaskName -TimerId $Id
+    }
+    if ($BeepAt -and @($BeepAt).Count -gt 0) {
+        $timer | Add-Member -NotePropertyName 'BeepAt' -NotePropertyValue @($BeepAt)
     }
     return $timer
 }
@@ -2854,7 +4372,9 @@ function Write-SequenceTimerConfirmation {
         [DateTime]$EndTime,
         [Nullable[DateTime]]$ScheduledStart,
         [string]$NotifyLabel = $null,
-        [string]$WebhookName = $null
+        [string]$WebhookName = $null,
+        [string]$SessionLabel = $null,
+        [Nullable[DateTime]]$FinalEndTime = $null
     )
     Write-Host ""
     if ($ScheduledStart) {
@@ -2864,6 +4384,10 @@ function Write-SequenceTimerConfirmation {
         Write-Host "  Sequence started " -ForegroundColor Green -NoNewline
     }
     Write-Host "[$Id]" -ForegroundColor Cyan
+    if ($SessionLabel) {
+        Write-Host "  Session:  " -ForegroundColor Gray -NoNewline
+        Write-Host $SessionLabel -ForegroundColor Cyan
+    }
     Write-Host "  Pattern:  " -ForegroundColor Gray -NoNewline
     Write-Host $OriginalPattern -ForegroundColor White
     Write-Host "  Total:    " -ForegroundColor Gray -NoNewline
@@ -2877,8 +4401,12 @@ function Write-SequenceTimerConfirmation {
         Write-Host "  Starts:   " -ForegroundColor Gray -NoNewline
         Write-Host $ScheduledStart.ToString('HH:mm:ss') -ForegroundColor Cyan
     }
-    Write-Host "  Ends at:  " -ForegroundColor Gray -NoNewline
+    Write-Host "  Phase end:" -ForegroundColor Gray -NoNewline
     Write-Host $EndTime.ToString('HH:mm:ss') -ForegroundColor Yellow
+    if ($FinalEndTime) {
+        Write-Host "  Final end:" -ForegroundColor Gray -NoNewline
+        Write-Host $FinalEndTime.ToString('HH:mm:ss') -ForegroundColor Yellow
+    }
     if ($NotifyLabel) {
         Write-Host "  Notify:   " -ForegroundColor Gray -NoNewline
         Write-Host $NotifyLabel -ForegroundColor Green
@@ -2914,21 +4442,31 @@ function Start-SequenceTimerJob {
     $webhookBlock = Get-TimerFireScriptWebhookBlock -WebhookUrl $webhookUrl
     $historyBlock = Get-TimerFireScriptHistoryBlock -TimerIdExpr '$timerId' -LabelExpr '$phaseLabel' -SecondsExpr '$timer.Seconds' -IsSequenceExpr '$true'
     $notifySoundLiteral = if ($channels.Sound) { '$true' } else { '$false' }
+    $notifyVoiceLiteral = if ($channels.Voice) { '$true' } else { '$false' }
     $webhookLiteral = if ($webhookUrl) { "'$($webhookUrl -replace "'", "''")'" } else { '$null' }
+    $voiceName = if ($Timer.PSObject.Properties.Name -contains 'VoiceName') { $Timer.VoiceName } else { $null }
+    $voiceRate = if ($Timer.PSObject.Properties.Name -contains 'VoiceRate') { [int]$Timer.VoiceRate } else { 0 }
+    $voiceVolume = if ($Timer.PSObject.Properties.Name -contains 'VoiceVolume') { [int]$Timer.VoiceVolume } else { 100 }
+    $voiceBlock = Get-TimerFireScriptVoiceBlock -Voice $channels.Voice -TextExpr '$announceText' -VoiceName $voiceName -VoiceRate $voiceRate -VoiceVolume $voiceVolume
+    $registerCuesBlock = Get-TimerFireScriptRegisterCuesBlock -TimerId $Timer.Id
+    $workoutCompleteText = (Resolve-TimerSpeechText -TemplateKey 'WorkoutComplete') -replace "'", "''"
+    Write-TimerCueRegistrarFile -TimerId $Timer.Id -VoiceName $voiceName -VoiceRate $voiceRate -VoiceVolume $voiceVolume | Out-Null
 
     # Build the notification script using here-string
     $script = @"
 `$timerId = '$($Timer.Id)'
 `$dataFile = '$dataFile'
+$(Get-TimerEmbeddedDataFileIoScript)
 `$notifyVisual = '$($channels.Visual)'
 `$notifySound = $notifySoundLiteral
+`$notifyVoice = $notifyVoiceLiteral
 `$webhookUrl = $webhookLiteral
 `$logFile = "`$env:TEMP\PSTimer_`$timerId.log"
 `$utf8Bom = New-Object System.Text.UTF8Encoding `$true
 
 function Write-TimerDataFile {
     param([array]`$Items)
-    [System.IO.File]::WriteAllText(`$dataFile, (ConvertTo-Json -InputObject `$Items -Depth 10), `$utf8Bom)
+    Write-TimerDataFileAtomic -DataFile `$dataFile -Content (ConvertTo-Json -InputObject `$Items -Depth 12)
 }
 
 try {
@@ -2952,63 +4490,69 @@ if (-not `$timer.IsSequence) { exit }
 `$totalPhases = [int]`$timer.TotalPhases
 `$phaseLabel = `$timer.PhaseLabel
 
-$soundBlock
-
+`$phases = @(`$timer.Phases)
+`$phaseCount = `$phases.Count
 `$nextPhaseIdx = `$currentPhase + 1
+`$announceText = ''
+if (`$notifyVoice) {
+    if (`$nextPhaseIdx -lt `$phaseCount) {
+        `$np = `$phases[`$nextPhaseIdx]
+        if (`$np.AnnounceStart) { `$announceText = [string]`$np.AnnounceStart }
+        elseif (`$np.Label) { `$announceText = [string]`$np.Label }
+    } elseif (`$nextPhaseIdx -ge `$totalPhases) {
+        `$announceText = '$workoutCompleteText'
+    }
+}
 
-if (`$nextPhaseIdx -lt `$totalPhases) {
-    `$phases = @(`$timer.Phases)
-    if (`$nextPhaseIdx -ge `$phases.Count) {
-        "`$(Get-Date -Format 'o') ERROR invalid phase index `$nextPhaseIdx (count=`$(`$phases.Count))" | Add-Content -LiteralPath `$logFile -Force
-        `$timer.State = 'Lost'
-        `$timer.TaskName = `$null
-        Write-TimerDataFile -Items `$timers
-    } else {
-        `$nextPhase = `$phases[`$nextPhaseIdx]
-        `$nextSeconds = [int]`$nextPhase.Seconds
-        `$nextLabel = `$nextPhase.Label
-        `$nextTaskName = "PSTimer_`$timerId_`$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
+if (`$nextPhaseIdx -lt `$phaseCount) {
+    if (`$nextPhaseIdx -ge `$totalPhases) {
+        "`$(Get-Date -Format 'o') WARN phase index `$nextPhaseIdx exceeds TotalPhases=`$totalPhases (count=`$phaseCount)" | Add-Content -LiteralPath `$logFile -Force
+    }
+    `$nextPhase = `$phases[`$nextPhaseIdx]
+    `$nextSeconds = [int]`$nextPhase.Seconds
+    `$nextLabel = `$nextPhase.Label
+    `$nextTaskName = "PSTimer_`${timerId}_`$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
 
-        `$nextTrigger = (Get-Date).AddSeconds(`$nextSeconds)
-        `$vbsPath = "`$env:TEMP\PSTimer_`$timerId.vbs"
-        `$nextAction = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument `"`$vbsPath`"
-        `$nextTriggerObj = New-ScheduledTaskTrigger -Once -At `$nextTrigger
-        `$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -Hidden
+    `$nextTrigger = (Get-Date).AddSeconds(`$nextSeconds)
+    `$vbsPath = "`$env:TEMP\PSTimer_`$timerId.vbs"
+    `$nextAction = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument `"`$vbsPath`"
+    `$nextTriggerObj = New-ScheduledTaskTrigger -Once -At `$nextTrigger
+    `$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -Hidden
 
-        `$registered = `$false
+    `$registered = `$false
+    try {
+        Register-ScheduledTask -TaskName `$nextTaskName -Action `$nextAction -Trigger `$nextTriggerObj -Settings `$settings -Force -ErrorAction Stop | Out-Null
+        `$registered = `$true
+    } catch {
         try {
             Register-ScheduledTask -TaskName `$nextTaskName -Action `$nextAction -Trigger `$nextTriggerObj -Settings `$settings -Force -ErrorAction Stop | Out-Null
             `$registered = `$true
         } catch {
-            try {
-                Register-ScheduledTask -TaskName `$nextTaskName -Action `$nextAction -Trigger `$nextTriggerObj -Settings `$settings -Force -ErrorAction Stop | Out-Null
-                `$registered = `$true
-            } catch {
-                "`$(Get-Date -Format 'o') ERROR re-registering task: `$(`$_.Exception.Message)" | Add-Content -LiteralPath `$logFile -Force
-            }
-        }
-
-        if (`$registered) {
-            `$timer.CurrentPhase = `$nextPhaseIdx
-            `$timer.PhaseLabel = `$nextLabel
-            `$timer.Seconds = `$nextSeconds
-            `$timer.Message = `$nextLabel
-            `$timer.StartTime = (Get-Date).ToString('o')
-            `$timer.EndTime = (Get-Date).AddSeconds(`$nextSeconds).ToString('o')
-            `$timer.State = 'Running'
-            `$timer.TaskName = `$nextTaskName
-            Write-TimerDataFile -Items `$timers
-            if (`$currentTaskName) {
-                Unregister-ScheduledTask -TaskName `$currentTaskName -Confirm:`$false -ErrorAction SilentlyContinue
-            }
-        } else {
-            `$timer.State = 'Paused'
-            `$timer | Add-Member -NotePropertyName 'RemainingSeconds' -NotePropertyValue `$nextSeconds -Force
-            `$timer.TaskName = `$null
-            Write-TimerDataFile -Items `$timers
+            "`$(Get-Date -Format 'o') ERROR re-registering task: `$(`$_.Exception.Message)" | Add-Content -LiteralPath `$logFile -Force
         }
     }
-} else {
+
+    if (`$registered) {
+        `$timer.CurrentPhase = `$nextPhaseIdx
+        `$timer.PhaseLabel = `$nextLabel
+        `$timer.Seconds = `$nextSeconds
+        `$timer.Message = `$nextLabel
+        `$timer.StartTime = (Get-Date).ToString('o')
+        `$timer.EndTime = (Get-Date).AddSeconds(`$nextSeconds).ToString('o')
+        `$timer.State = 'Running'
+        `$timer.TaskName = `$nextTaskName
+        Write-TimerDataFile -Items `$timers
+$registerCuesBlock
+        if (`$currentTaskName) {
+            Unregister-ScheduledTask -TaskName `$currentTaskName -Confirm:`$false -ErrorAction SilentlyContinue
+        }
+    } else {
+        `$timer.State = 'Paused'
+        `$timer | Add-Member -NotePropertyName 'RemainingSeconds' -NotePropertyValue `$nextSeconds -Force
+        `$timer.TaskName = `$null
+        Write-TimerDataFile -Items `$timers
+    }
+} elseif (`$nextPhaseIdx -ge `$totalPhases) {
     `$timer.State = 'Completed'
     `$timer.CurrentPhase = `$totalPhases
     `$timer.TaskName = `$null
@@ -3019,7 +4563,16 @@ if (`$nextPhaseIdx -lt `$totalPhases) {
     }
     Remove-Item -LiteralPath "`$env:TEMP\PSTimer_`$timerId.ps1" -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath "`$env:TEMP\PSTimer_`$timerId.vbs" -Force -ErrorAction SilentlyContinue
+} else {
+    "`$(Get-Date -Format 'o') ERROR invalid phase index `$nextPhaseIdx (TotalPhases=`$totalPhases, count=`$phaseCount)" | Add-Content -LiteralPath `$logFile -Force
+    `$timer.State = 'Lost'
+    `$timer.TaskName = `$null
+    Write-TimerDataFile -Items `$timers
 }
+
+$voiceBlock
+
+$soundBlock
 
 } catch {
     "`$(Get-Date -Format 'o') ERROR: `$(`$_.Exception.Message)" | Add-Content -LiteralPath `$logFile -Force
@@ -3047,6 +4600,13 @@ $historyBlock
 
     Register-TimerScheduledTaskAsync -TimerId $Timer.Id -TaskName $taskName -TriggerTime $triggerTime -VbsPath $vbsPath
     $Timer | Add-Member -NotePropertyName 'TaskName' -NotePropertyValue $taskName -Force
+
+    $phaseIndex = if ($Timer.PSObject.Properties.Name -contains 'CurrentPhase') { [int]$Timer.CurrentPhase } else { 0 }
+    $currentPhaseObj = $null
+    if ($Timer.Phases -and $Timer.Phases.Count -gt $phaseIndex) {
+        $currentPhaseObj = $Timer.Phases[$phaseIndex]
+    }
+    Register-TimerPhaseCueTasks -Timer $Timer -PhaseSeconds $Timer.Seconds -Phase $currentPhaseObj
 }
 
 function Start-TimerScheduledJob {
@@ -3077,7 +4637,8 @@ function Show-TimerHelp {
         Shows timer commands help dashboard.
     #>
     Write-HelpMenu -Title "TIMER COMMANDS" -Commands @(
-        @{ Name='Timer <time>'; Alias='T'; Params='[msg] [repeat] [-Visual] [-Sound] [-Webhook] [-At]'; Desc='Start a timer (simple or sequence pattern)' }
+        @{ Name='Timer <time>'; Alias='T'; Params='[msg] [repeat] [-Visual] [-Sound] [-Voice] [-Countdown] [-BeepAt] [-Webhook] [-At]'; Desc='Start a timer (simple, sequence, or t workout)' }
+        @{ Name='Timer-Workout'; Alias='TWKO'; Params='[routine] [-List] [-Voice] [-Countdown]'; Desc='Structured workout with voice coaching' }
         @{ Name='Timer-Stats'; Alias='TS'; Params=''; Desc='Show timer completion history (today/week)' }
         @{ Name='Timer-Presets'; Alias='TPRE'; Params=''; Desc='Pick from preset sequences (Pomodoro, etc.)' }
         @{ Name='Timer-List'; Alias='TL'; Params='[-a] [-w]'; Desc='List active timers (-a all, -w live watch)' }
@@ -3106,17 +4667,20 @@ function Show-TimerHelp {
                 @{ Type='example'; Code='t pomodoro                 '; Comment='# Use preset' }
                 @{ Type='example'; Code='t "(25m work, 5m rest)x4" '; Comment='# 4 cycles' }
                 @{ Type='raw'; Text='    t "(50m focus, 10m break)x3, 30m ''long break''"' ; Color='Gray' }
+                @{ Type='example'; Code='t tabata                     '; Comment='# Voice HIIT preset' }
+                @{ Type='example'; Code='t workout upper-push         '; Comment='# Structured workout' }
                 @{ Type='raw'; Text='' }
-                @{ Type='text'; Label='  Presets: '; Value='pomodoro, pomodoro-short, pomodoro-long, 52-17, 90-20' }
+                @{ Type='text'; Label='  Presets: '; Value='pomodoro, tabata, gym-sets, hiit-30-30, emom-12' }
             )
         }
         @{
             Title = 'NOTIFICATION OPTIONS'
             Underline = '===================='
             Lines = @(
-                @{ Type='text'; Label='  Per-timer: '; Value='t 25m -Visual toast -Sound -Webhook discord-main'; LabelColor='Yellow'; ValueColor='Gray' }
+                @{ Type='text'; Label='  Per-timer: '; Value='t 25m -Visual toast -Sound -Voice -Countdown 321'; LabelColor='Yellow'; ValueColor='Gray' }
+                @{ Type='text'; Label='  Mid-timer:  '; Value='t 5m stretch -BeepAt 3m,1m'; LabelColor='Yellow'; ValueColor='Gray' }
                 @{ Type='raw'; Text='' }
-                @{ Type='raw'; Text='  Channels: Visual popup|toast|none  Sound on|off  Webhook if set'; Color='Green' }
+                @{ Type='raw'; Text='  Channels: Visual popup|toast|none  Sound on|off  Voice on|off  Webhook if set'; Color='Green' }
                 @{ Type='raw'; Text='  Legacy: -Notify popup|toast|sound|silent|webhook' }
                 @{ Type='raw'; Text='' }
                 @{ Type='raw'; Text='  Default: config.ps1 -> TimerDefaults.Visual, .Sound, .Webhook' }
@@ -3172,6 +4736,11 @@ function Timer {
         [string]$Visual = $null,
         [switch]$Sound,
         [switch]$NoSound,
+        [switch]$Voice,
+        [switch]$NoVoice,
+        [ValidateSet('none', '321', '10', 'both')]
+        $Countdown = $null,
+        [string]$BeepAt = $null,
         [string]$Webhook = $null,
         [string]$At = $null,
         [ValidateSet('none', 'watch', 'list')]
@@ -3184,10 +4753,56 @@ function Timer {
         return
     }
 
+    if ($Time -eq 'workout') {
+        $routineName = if ($Message -ne 'Time is up!') { $Message } else { $null }
+        $soundOverride = if ($Sound) { $true } elseif ($NoSound) { $false } else { $null }
+        $voiceOverride = if ($Voice) { $true } elseif ($NoVoice) { $false } else { $null }
+        $workoutParams = @{
+            Routine       = $routineName
+            Notify        = $Notify
+            Visual        = $Visual
+            SoundOverride = $soundOverride
+            VoiceOverride = $voiceOverride
+            Webhook       = $Webhook
+            At            = $At
+            AfterStart    = $AfterStart
+        }
+        if ($Countdown -in @('none', '321', '10', 'both')) {
+            $workoutParams['Countdown'] = $Countdown
+        }
+        Timer-Workout @workoutParams
+        return
+    }
+
+    if ($script:TimerPresets.Keys -contains $Time) {
+        $simplePreset = $script:TimerPresets[$Time]
+        if (Test-TimerSimpleRepeatingPreset -Preset $simplePreset) {
+            $presetNotify = Get-TimerPresetNotifyOverrides -Preset $simplePreset
+            $Time = [string]$simplePreset.Time
+            if ($Message -eq 'Time is up!' -and $simplePreset.Message) {
+                $Message = [string]$simplePreset.Message
+            }
+            if ($Repeat -le 1 -and $simplePreset.Repeat) {
+                $Repeat = [int]$simplePreset.Repeat
+            }
+            if (-not $Notify -and $presetNotify.Notify) { $Notify = $presetNotify.Notify }
+            if (-not $Visual -and $presetNotify.Visual) { $Visual = $presetNotify.Visual }
+            if (-not $Sound -and -not $NoSound -and $null -ne $presetNotify.Sound) {
+                if ($presetNotify.Sound) { $Sound = $true } else { $NoSound = $true }
+            }
+            if (-not $Voice -and -not $NoVoice -and $null -ne $presetNotify.Voice) {
+                if ($presetNotify.Voice) { $Voice = $true } else { $NoVoice = $true }
+            }
+            if (-not $Webhook -and $presetNotify.Webhook) { $Webhook = $presetNotify.Webhook }
+            if (-not $Countdown -and $presetNotify.Countdown) { $Countdown = $presetNotify.Countdown }
+        }
+    }
+
     # Check if this is a sequence pattern or preset
     if (Test-TimerSequence -Pattern $Time) {
         $soundOverride = if ($Sound) { $true } elseif ($NoSound) { $false } else { $null }
-        Start-SequenceTimer -Pattern $Time -Notify $Notify -Visual $Visual -SoundOverride $soundOverride -Webhook $Webhook -At $At -AfterStart $AfterStart
+        $voiceOverride = if ($Voice) { $true } elseif ($NoVoice) { $false } else { $null }
+        Start-SequenceTimer -Pattern $Time -Notify $Notify -Visual $Visual -SoundOverride $soundOverride -VoiceOverride $voiceOverride -CountdownOverride $Countdown -BeepAtOverride $BeepAt -Webhook $Webhook -At $At -AfterStart $AfterStart
         return
     }
 
@@ -3217,7 +4832,14 @@ function Timer {
     $timerState = if ($scheduledStart) { 'Scheduled' } else { 'Running' }
 
     $soundOverride = if ($Sound) { $true } elseif ($NoSound) { $false } else { $null }
-    $notifySettings = Resolve-TimerNotificationSettings -NotifyOverride $Notify -VisualOverride $Visual -SoundOverride $soundOverride -WebhookOverride $Webhook
+    $voiceOverride = if ($Voice) { $true } elseif ($NoVoice) { $false } else { $null }
+    $notifySettings = Resolve-TimerNotificationSettings -NotifyOverride $Notify -VisualOverride $Visual -SoundOverride $soundOverride -VoiceOverride $voiceOverride -CountdownOverride $Countdown -WebhookOverride $Webhook
+
+    $beepAtSeconds = if ($BeepAt) { @(Parse-BeepAtList -InputObject $BeepAt) } else { @() }
+    if ($BeepAt -and $beepAtSeconds.Count -eq 0) {
+        Write-Host "Invalid -BeepAt. Use comma-separated durations (e.g. 3m,1m)." -ForegroundColor Red
+        return
+    }
 
     $timer = [PSCustomObject]@{
         Id              = $id
@@ -3233,9 +4855,18 @@ function Timer {
         IsSequence      = $false
         NotifyVisual    = $notifySettings.Visual
         NotifySound     = $notifySettings.Sound
+        NotifyVoice     = $notifySettings.Voice
         NotifyType      = $notifySettings.NotifyType
         WebhookName     = $notifySettings.WebhookName
+        VoiceName       = $notifySettings.VoiceName
+        VoiceRate       = $notifySettings.VoiceRate
+        VoiceVolume     = $notifySettings.VoiceVolume
+        CountdownMode   = $notifySettings.Countdown
+        CueTaskNames    = @()
         TaskName        = New-TimerTaskName -TimerId $id
+    }
+    if ($beepAtSeconds.Count -gt 0) {
+        $timer | Add-Member -NotePropertyName 'BeepAt' -NotePropertyValue @($beepAtSeconds)
     }
 
     $timers = @(Get-TimerData)
@@ -3267,10 +4898,111 @@ function Timer {
     Write-Host "  Message:  " -ForegroundColor Gray -NoNewline
     Write-Host $Message -ForegroundColor White
     Write-Host "  Notify:   " -ForegroundColor Gray -NoNewline
-    Write-Host $notifySettings.Label -ForegroundColor Green
+    $notifyLabel = Format-TimerNotifyLabel -Visual $notifySettings.Visual -Sound $notifySettings.Sound -WebhookName $notifySettings.WebhookName -Voice $notifySettings.Voice -CountdownMode $notifySettings.Countdown -BeepAt $(if ($beepAtSeconds.Count -gt 0) { @($beepAtSeconds | ForEach-Object { Format-Duration -Seconds $_ }) } else { $null })
+    Write-Host $notifyLabel -ForegroundColor Green
     Write-Host ""
 
     Invoke-TimerAfterStart -TimerId $id -AfterStart $AfterStart
+}
+
+function Timer-Workout {
+    <#
+    .SYNOPSIS
+        Starts a structured workout routine with voice coaching.
+    #>
+    param(
+        [string]$Routine = $null,
+        [switch]$List,
+        [string]$Notify = $null,
+        [string]$Visual = $null,
+        $SoundOverride = $null,
+        $VoiceOverride = $null,
+        [ValidateSet('none', '321', '10', 'both')]
+        $Countdown = $null,
+        [string]$Webhook = $null,
+        [string]$At = $null,
+        [string]$AfterStart = $null
+    )
+
+    $workouts = Get-PS1TimerModuleWorkouts
+    if ($List -or ($workouts.Count -eq 0 -and -not $Routine)) {
+        if ($workouts.Count -eq 0) {
+            Write-Host "`n  No workouts defined in Config.Workouts.`n" -ForegroundColor Yellow
+            return
+        }
+        Write-Host "`n  WORKOUT ROUTINES" -ForegroundColor Cyan
+        foreach ($key in ($workouts.Keys | Sort-Object)) {
+            $w = $workouts[$key]
+            $desc = if ($w.Description) { $w.Description } else { '' }
+            Write-Host "    $key" -ForegroundColor Yellow -NoNewline
+            if ($desc) { Write-Host " — $desc" -ForegroundColor DarkGray }
+            else { Write-Host '' }
+        }
+        Write-Host ""
+        return
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Routine)) {
+        $options = Get-WorkoutPickerOptions
+        if ($options.Count -eq 0) {
+            Write-Host "`n  No workouts defined in Config.Workouts.`n" -ForegroundColor Yellow
+            return
+        }
+        $Routine = Show-MenuPicker -Title 'SELECT WORKOUT ROUTINE' -Options $options -AllowCancel
+        if (-not $Routine) { return }
+    }
+
+    if (-not $workouts.ContainsKey($Routine)) {
+        Write-Host "`n  Workout '$Routine' not found. Use 't workout -List' or Config.Workouts.`n" -ForegroundColor Red
+        return
+    }
+
+    $workout = $workouts[$Routine]
+    $presetNotify = $null
+    $presetVisual = $null
+    $presetSound = $null
+    $presetVoice = $null
+    $presetWebhook = $null
+    $presetCountdown = $null
+    if ($workout.Notify) { $presetNotify = $workout.Notify }
+    if ($workout.Visual) { $presetVisual = $workout.Visual }
+    if ($workout.ContainsKey('Sound')) { $presetSound = [bool]$workout.Sound }
+    if ($workout.ContainsKey('Voice')) { $presetVoice = [bool]$workout.Voice }
+    if ($workout.Webhook) { $presetWebhook = $workout.Webhook }
+    if ($workout.Countdown) { $presetCountdown = [string]$workout.Countdown }
+
+    try {
+        $phases = @(ConvertFrom-WorkoutRoutine -RoutineName $Routine -CountdownMode $Countdown)
+    }
+    catch {
+        Write-Host "`n  $($_.Exception.Message)`n" -ForegroundColor Red
+        return
+    }
+
+    if ($phases.Count -eq 0) {
+        Write-Host "`n  Workout '$Routine' produced no phases.`n" -ForegroundColor Red
+        return
+    }
+
+    $patternLabel = "workout:$Routine"
+    $startNotify = if ($Notify) { $Notify } elseif ($presetNotify) { $presetNotify } else { $null }
+    $startVisual = if ($Visual) { $Visual } elseif ($presetVisual) { $presetVisual } else { $null }
+    $startSound = if ($null -ne $SoundOverride) { $SoundOverride } elseif ($null -ne $presetSound) { $presetSound } else { $null }
+    $startVoice = if ($null -ne $VoiceOverride) { $VoiceOverride } elseif ($null -ne $presetVoice) { $presetVoice } else { $null }
+    $startWebhook = if ($Webhook) { $Webhook } elseif ($presetWebhook) { $presetWebhook } else { $null }
+    $startCountdown = if ($Countdown -in @('none', '321', '10', 'both')) { $Countdown } elseif ($presetCountdown) { $presetCountdown } else { $null }
+
+    Start-SequenceTimer -Pattern $patternLabel -PhasesOverride $phases `
+        -Notify $startNotify `
+        -Visual $startVisual `
+        -SoundOverride $startSound `
+        -VoiceOverride $startVoice `
+        -CountdownOverride $startCountdown `
+        -Webhook $startWebhook `
+        -At $At `
+        -AfterStart $AfterStart `
+        -IsWorkout `
+        -WorkoutRoutine $Routine
 }
 
 function Start-SequenceTimer {
@@ -3297,27 +5029,42 @@ function Start-SequenceTimer {
         [string]$Notify = $null,
         [string]$Visual = $null,
         $SoundOverride = $null,
+        $VoiceOverride = $null,
+        [string]$CountdownOverride = $null,
+        [string]$BeepAtOverride = $null,
         [string]$Webhook = $null,
         [string]$At = $null,
-        [string]$AfterStart = $null
+        [string]$AfterStart = $null,
+        [switch]$IsWorkout,
+        [string]$WorkoutRoutine = $null,
+        [array]$PhasesOverride = $null
     )
 
     $originalPattern = $Pattern
     $presetNotify = $null
     $presetVisual = $null
     $presetSound = $null
+    $presetVoice = $null
     $presetWebhook = $null
-    if (($script:TimerPresets.Keys -contains $Pattern)) {
+    $presetCountdown = $null
+    if (-not $PhasesOverride -and ($script:TimerPresets.Keys -contains $Pattern)) {
         $preset = $script:TimerPresets[$Pattern]
         $Pattern = $preset.Pattern
         if ($preset.Notify) { $presetNotify = $preset.Notify }
         if ($preset.Visual) { $presetVisual = $preset.Visual }
         if ($preset.ContainsKey('Sound')) { $presetSound = [bool]$preset.Sound }
+        if ($preset.ContainsKey('Voice')) { $presetVoice = [bool]$preset.Voice }
         if ($preset.Webhook) { $presetWebhook = $preset.Webhook }
+        if ($preset.Countdown) { $presetCountdown = [string]$preset.Countdown }
     }
 
     try {
-        $phases = @(ConvertFrom-TimerSequence -Pattern $Pattern)
+        if ($PhasesOverride) {
+            $phases = @($PhasesOverride)
+        }
+        else {
+            $phases = @(ConvertFrom-TimerSequence -Pattern $Pattern)
+        }
     }
     catch {
         Write-Host "`n  Invalid sequence pattern: $Pattern" -ForegroundColor Red
@@ -3343,22 +5090,96 @@ function Start-SequenceTimer {
         }
     }
 
-    $notifySettings = Resolve-TimerNotificationSettings -NotifyOverride $Notify -VisualOverride $Visual -SoundOverride $SoundOverride -WebhookOverride $Webhook -PresetNotify $presetNotify -PresetVisual $presetVisual -PresetSound $presetSound -PresetWebhook $presetWebhook
+    $notifySettings = Resolve-TimerNotificationSettings -NotifyOverride $Notify -VisualOverride $Visual -SoundOverride $SoundOverride -VoiceOverride $VoiceOverride -CountdownOverride $CountdownOverride -WebhookOverride $Webhook -PresetNotify $presetNotify -PresetVisual $presetVisual -PresetSound $presetSound -PresetVoice $presetVoice -PresetWebhook $presetWebhook -PresetCountdown $presetCountdown
+
+    $beepAtSeconds = if ($BeepAtOverride) { @(Parse-BeepAtList -InputObject $BeepAtOverride) } else { @() }
+    if ($BeepAtOverride -and $beepAtSeconds.Count -eq 0) {
+        Write-Host "Invalid -BeepAt. Use comma-separated durations (e.g. 3m,1m)." -ForegroundColor Red
+        return
+    }
+
     $startTime = if ($scheduledStart) { $scheduledStart } else { $now }
     $timerState = if ($scheduledStart) { 'Scheduled' } else { 'Running' }
 
-    $timer = New-SequenceTimerFromPhases -Id $id -OriginalPattern $originalPattern -Phases $phases -Summary $summary -Now $startTime -NotifyVisual $notifySettings.Visual -NotifySound $notifySettings.Sound -NotifyType $notifySettings.NotifyType -WebhookName $notifySettings.WebhookName
-    $timer.State = $timerState
+    $timer = New-SequenceTimerFromPhases -Id $id -OriginalPattern $originalPattern -Phases $phases -Summary $summary -Now $startTime -NotifyVisual $notifySettings.Visual -NotifySound $notifySettings.Sound -NotifyVoice $notifySettings.Voice -NotifyType $notifySettings.NotifyType -WebhookName $notifySettings.WebhookName -VoiceName $notifySettings.VoiceName -VoiceRate $notifySettings.VoiceRate -VoiceVolume $notifySettings.VoiceVolume -CountdownMode $notifySettings.Countdown -IsWorkout:$IsWorkout -WorkoutRoutine $WorkoutRoutine -BeepAt $beepAtSeconds
     $firstPhase = $phases[0]
-    $timer.EndTime = $startTime.AddSeconds($firstPhase.Seconds).ToString('o')
+    $afterStartAction = Get-TimerAfterStartAction -Override $AfterStart
+    $deferTimerStartForIntro = $notifySettings.Voice -and -not $scheduledStart -and $IsWorkout
+    $speechVoiceParams = @{
+        VoiceName   = $notifySettings.VoiceName
+        VoiceRate   = $notifySettings.VoiceRate
+        VoiceVolume = $notifySettings.VoiceVolume
+    }
 
-    $timers = @(Get-TimerData)
-    $timers += $timer
-    Save-TimerData -Timers $timers
-    Start-SequenceTimerJob -Timer $timer
+    if ($deferTimerStartForIntro) {
+        $introText = Get-SequenceTimerIntroSpeechText -IsWorkout:$IsWorkout -WorkoutRoutine $WorkoutRoutine -FirstPhase $firstPhase -StartTime $startTime -Summary $summary -Phases $phases
+        if (-not [string]::IsNullOrWhiteSpace($introText)) {
+            Write-Host "  Reading workout intro..." -ForegroundColor Cyan
+            Invoke-TimerSpeechQueue -Texts @($introText) @speechVoiceParams
+        }
 
-    $endTime = [DateTime]::Parse($timer.EndTime)
-    Write-SequenceTimerConfirmation -Id $id -OriginalPattern $originalPattern -Summary $summary -PhaseCount $phases.Count -FirstPhase $firstPhase -EndTime $endTime -ScheduledStart $scheduledStart -NotifyLabel $notifySettings.Label
+        $phaseStart = Get-Date
+        $timer.State = 'Running'
+        $timer.StartTime = $phaseStart.ToString('o')
+        $timer.EndTime = $phaseStart.AddSeconds($firstPhase.Seconds).ToString('o')
+        $startTime = $phaseStart
+
+        $timers = @(Get-TimerData)
+        $timers += $timer
+        Save-TimerData -Timers $timers
+        Start-SequenceTimerJob -Timer $timer
+
+        $phaseEndTime = [DateTime]::Parse($timer.EndTime)
+        $finalEnd = $phaseStart.AddSeconds($summary.TotalSeconds)
+        $sessionLabel = $null
+        if ($WorkoutRoutine) {
+            $workouts = Get-PS1TimerModuleWorkouts
+            if ($workouts -and $workouts.ContainsKey($WorkoutRoutine)) {
+                $w = $workouts[$WorkoutRoutine]
+                $sessionLabel = if ($w.Description) { [string]$w.Description } else { $WorkoutRoutine }
+            }
+        }
+        Write-SequenceTimerConfirmation -Id $id -OriginalPattern $originalPattern -Summary $summary -PhaseCount $phases.Count -FirstPhase $firstPhase -EndTime $phaseEndTime -ScheduledStart $scheduledStart -NotifyLabel $notifySettings.Label -SessionLabel $sessionLabel -FinalEndTime $finalEnd
+    }
+    else {
+        $timer.State = $timerState
+        $timer.EndTime = $startTime.AddSeconds($firstPhase.Seconds).ToString('o')
+
+        $timers = @(Get-TimerData)
+        $timers += $timer
+        Save-TimerData -Timers $timers
+        Start-SequenceTimerJob -Timer $timer
+
+        $phaseEndTime = [DateTime]::Parse($timer.EndTime)
+        $finalEnd = $startTime.AddSeconds($summary.TotalSeconds)
+        $sessionLabel = $null
+        if ($IsWorkout -and $WorkoutRoutine) {
+            $workouts = Get-PS1TimerModuleWorkouts
+            if ($workouts -and $workouts.ContainsKey($WorkoutRoutine)) {
+                $w = $workouts[$WorkoutRoutine]
+                $sessionLabel = if ($w.Description) { [string]$w.Description } else { $WorkoutRoutine }
+            }
+        }
+        Write-SequenceTimerConfirmation -Id $id -OriginalPattern $originalPattern -Summary $summary -PhaseCount $phases.Count -FirstPhase $firstPhase -EndTime $phaseEndTime -ScheduledStart $scheduledStart -NotifyLabel $notifySettings.Label -SessionLabel $sessionLabel -FinalEndTime $finalEnd
+
+        if ($notifySettings.Voice -and -not $scheduledStart) {
+            $speechTexts = Get-SequenceTimerStartSpeechTexts -IsWorkout:$IsWorkout -WorkoutRoutine $WorkoutRoutine -FirstPhase $firstPhase -StartTime $startTime -Summary $summary -Phases $phases
+            if ($speechTexts.Count -gt 0) {
+                $speechParams = @{
+                    Texts       = $speechTexts
+                    VoiceName   = $notifySettings.VoiceName
+                    VoiceRate   = $notifySettings.VoiceRate
+                    VoiceVolume = $notifySettings.VoiceVolume
+                }
+                if ($afterStartAction -in @('watch', 'list')) {
+                    Invoke-TimerSpeechQueueAsync @speechParams
+                }
+                else {
+                    Invoke-TimerSpeechQueue @speechParams
+                }
+            }
+        }
+    }
 
     Invoke-TimerAfterStart -TimerId $id -AfterStart $AfterStart
 }
@@ -3660,6 +5481,61 @@ function Test-TimerWatchAwaitingContinuation {
     return $repeatRemaining -gt 0
 }
 
+function Get-TimerWatchOptimisticNextPhaseDisplay {
+    <#
+    .SYNOPSIS
+        Predicts the next sequence phase for watch UI while the scheduled task transitions.
+    #>
+    param(
+        [PSCustomObject]$Timer,
+        [DateTime]$PreviousEndTime,
+        [DateTime]$Now = (Get-Date)
+    )
+
+    if (-not $Timer.IsSequence) { return $null }
+
+    $currentPhase = [int]$Timer.CurrentPhase
+    $totalPhases = if ($null -ne $Timer.TotalPhases) { [int]$Timer.TotalPhases } else { 0 }
+    $nextIdx = $currentPhase + 1
+    if ($nextIdx -ge $totalPhases) { return $null }
+
+    $phases = @($Timer.Phases)
+    if ($nextIdx -ge $phases.Count) { return $null }
+
+    $nextPhase = $phases[$nextIdx]
+    $nextSeconds = [int]$nextPhase.Seconds
+    if ($nextSeconds -le 0) { return $null }
+
+    $nextLabel = if ($nextPhase.Label) { [string]$nextPhase.Label } else { '' }
+    $predictedStart = if ($PreviousEndTime -gt $Now) { $PreviousEndTime } else { $Now }
+    $predictedEnd = $predictedStart.AddSeconds($nextSeconds)
+
+    $displayTimer = [PSCustomObject]@{
+        Id            = $Timer.Id
+        IsSequence    = $true
+        CurrentPhase  = $nextIdx
+        TotalPhases   = $totalPhases
+        PhaseLabel    = $nextLabel
+        Seconds       = $nextSeconds
+        TotalSeconds  = $Timer.TotalSeconds
+        Message       = $nextLabel
+        StartTime     = $predictedStart.ToString('o')
+        EndTime       = $predictedEnd.ToString('o')
+        State         = 'Running'
+        Phases        = $Timer.Phases
+        NotifyVisual  = $Timer.NotifyVisual
+        NotifySound   = $Timer.NotifySound
+        NotifyVoice   = $Timer.NotifyVoice
+        CountdownMode = if ($nextPhase.PSObject.Properties.Name -contains 'Countdown' -and $nextPhase.Countdown) { [string]$nextPhase.Countdown } elseif ($Timer.PSObject.Properties.Name -contains 'CountdownMode') { $Timer.CountdownMode } else { 'none' }
+    }
+
+    return [PSCustomObject]@{
+        DisplayTimer = $displayTimer
+        EndTime      = $predictedEnd
+        TotalSeconds = $nextSeconds
+    }
+}
+
 function Write-TimerWatchCompletedScreen {
     param(
         [hashtable]$Colors,
@@ -3695,6 +5571,8 @@ function Show-TimerWatchDisplay {
     $c = Get-AnsiColors
     try { [Console]::CursorVisible = $false } catch { }
     $sw = [System.Diagnostics.Stopwatch]::new()
+    $watchId = [string]$Timer.Id
+    $showHelp = $false
 
     try {
         $totalSeconds = $Timer.Seconds
@@ -3705,82 +5583,185 @@ function Show-TimerWatchDisplay {
             $sw.Restart()
             $now = Get-Date
 
+            $allTimers = @()
+            try {
+                $allTimers = @(Sync-TimerData)
+            }
+            catch {
+                $allTimers = @(Get-TimerData)
+            }
+            $activeTimers = Get-TimerWatchActiveTimers -Timers $allTimers
             $cacheResult = Get-TimerDataIfChanged
             if ($cacheResult.Changed) {
-                $currentTimer = $cacheResult.Data | Where-Object { $_.Id -eq $Timer.Id }
+                $currentTimer = @($cacheResult.Data | Where-Object { [string]$_.Id -eq $watchId })[0]
                 if ($currentTimer -and $currentTimer.EndTime) {
                     $endTime = [DateTime]::Parse($currentTimer.EndTime)
                 }
             }
 
-            if (-not $currentTimer -or ($currentTimer.State -ne 'Running' -and $currentTimer.State -ne 'Scheduled')) {
+            if (-not $currentTimer) {
                 Clear-Host
                 Write-Host ""
-                Write-Host "  Timer [$($Timer.Id)] is no longer running." -ForegroundColor Yellow
+                Write-Host "  Timer [$watchId] was removed." -ForegroundColor Yellow
                 Write-Host ""
                 break
             }
 
-            $remaining = $endTime - $now
-            $remainingSeconds = [math]::Max(0, $remaining.TotalSeconds)
-            $percent = Get-TimerProgress -Timer $currentTimer
+            if ($currentTimer.State -notin @('Running', 'Scheduled', 'Paused')) {
+                Clear-Host
+                Write-Host ""
+                Write-Host "  Timer [$watchId] is no longer active (state: $($currentTimer.State))." -ForegroundColor Yellow
+                Write-Host ""
+                break
+            }
 
-            if ($remainingSeconds -le 0) {
-                if (-not (Test-TimerWatchAwaitingContinuation -Timer $currentTimer)) {
-                    Write-TimerWatchCompletedScreen -Colors $c -CurrentTimer $currentTimer -Timer $Timer -TotalSeconds $totalSeconds -EndTime $endTime
-                    break
-                }
+            $displayTimer = $currentTimer
+            $displayEndTime = $endTime
+            $displayTotalSeconds = if ($currentTimer.IsSequence) { [int]$currentTimer.Seconds } else { $totalSeconds }
 
-                $foundNextRun = $false
-                $pollMs = @(500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000)
-                foreach ($delay in $pollMs) {
-                    $endsAtStr = $endTime.ToString('HH:mm:ss')
-                    $sb = Get-TimerWatchRunningContent -Colors $c -CurrentTimer $currentTimer -Timer $Timer -Percent 100 -Remaining ([TimeSpan]::Zero) -EndsAtFormatted $endsAtStr -Finishing
-                    $phaseSb = Get-TimerWatchPhaseTimelineContent -Colors $c -CurrentTimer $currentTimer
-                    if ($phaseSb) {
-                        [void]$sb.Append($phaseSb.ToString())
-                    }
-                    [void]$sb.AppendLine("")
-                    [void]$sb.AppendLine("$($c.Dim)  Press any key to exit watch mode...$($c.Reset)")
-                    Clear-Host
-                    [Console]::Write($sb.ToString())
+            if ($currentTimer.State -eq 'Paused') {
+                $remaining = [TimeSpan]::FromSeconds([int]$currentTimer.RemainingSeconds)
+                $percent = 0
+                $remainingSeconds = [int]$currentTimer.RemainingSeconds
+            }
+            else {
+                $remaining = $displayEndTime - $now
+                $remainingSeconds = [math]::Max(0, $remaining.TotalSeconds)
+                $percent = Get-TimerProgress -Timer $displayTimer
 
-                    Start-Sleep -Milliseconds $delay
-                    $refresh = Get-TimerDataIfChanged -Force
-                    $refreshed = @($refresh.Data | Where-Object { [string]$_.Id -eq [string]$Timer.Id })[0]
-                    if ($refreshed -and $refreshed.State -eq 'Completed') {
-                        $currentTimer = $refreshed
+                if ($currentTimer.State -eq 'Running' -and $remainingSeconds -le 0) {
+                    if (-not (Test-TimerWatchAwaitingContinuation -Timer $currentTimer)) {
+                        Write-TimerWatchCompletedScreen -Colors $c -CurrentTimer $currentTimer -Timer $Timer -TotalSeconds $totalSeconds -EndTime $endTime
                         break
                     }
-                    if ($refreshed -and $refreshed.State -eq 'Running' -and $refreshed.EndTime) {
-                        $refreshedEnd = [DateTime]::Parse($refreshed.EndTime)
-                        if ($refreshedEnd -gt (Get-Date)) {
-                            $currentTimer = $refreshed
-                            $endTime = $refreshedEnd
-                            $totalSeconds = if ($refreshed.IsSequence) { $refreshed.TotalSeconds } else { $refreshed.Seconds }
-                            $foundNextRun = $true
+
+                    $refresh = Get-TimerDataIfChanged -Force
+                    $refreshed = @($refresh.Data | Where-Object { [string]$_.Id -eq $watchId })[0]
+                    if ($refreshed) {
+                        if ($refreshed.State -eq 'Completed') {
+                            Write-TimerWatchCompletedScreen -Colors $c -CurrentTimer $refreshed -Timer $Timer -TotalSeconds $totalSeconds -EndTime $endTime
+                            break
+                        }
+                        if ($refreshed.State -eq 'Running' -and $refreshed.EndTime) {
+                            $refreshedEnd = [DateTime]::Parse($refreshed.EndTime)
+                            if ($refreshedEnd -gt $now) {
+                                $currentTimer = $refreshed
+                                $endTime = $refreshedEnd
+                                $displayTimer = $refreshed
+                                $displayEndTime = $refreshedEnd
+                                $displayTotalSeconds = [int]$refreshed.Seconds
+                                $remaining = $displayEndTime - $now
+                                $remainingSeconds = [math]::Max(0, $remaining.TotalSeconds)
+                                $percent = Get-TimerProgress -Timer $displayTimer
+                            }
+                        }
+                    }
+
+                    if ($remainingSeconds -le 0) {
+                        $optimistic = Get-TimerWatchOptimisticNextPhaseDisplay -Timer $currentTimer -PreviousEndTime $endTime -Now $now
+                        if ($optimistic) {
+                            $displayTimer = $optimistic.DisplayTimer
+                            $displayEndTime = $optimistic.EndTime
+                            $displayTotalSeconds = $optimistic.TotalSeconds
+                            $remaining = $displayEndTime - $now
+                            $remainingSeconds = [math]::Max(0, $remaining.TotalSeconds)
+                            $percent = Get-TimerProgress -Timer $displayTimer
+                        }
+                        else {
+                            $foundNextRun = $false
+                            $pollMs = @(200, 200, 300, 500, 500, 1000, 1000, 1000)
+                            foreach ($delay in $pollMs) {
+                                Start-Sleep -Milliseconds $delay
+                                $pollRefresh = Get-TimerDataIfChanged -Force
+                                $pollTimer = @($pollRefresh.Data | Where-Object { [string]$_.Id -eq $watchId })[0]
+                                if ($pollTimer -and $pollTimer.State -eq 'Completed') {
+                                    Write-TimerWatchCompletedScreen -Colors $c -CurrentTimer $pollTimer -Timer $Timer -TotalSeconds $totalSeconds -EndTime $endTime
+                                    return
+                                }
+                                if ($pollTimer -and $pollTimer.State -eq 'Running' -and $pollTimer.EndTime) {
+                                    $pollEnd = [DateTime]::Parse($pollTimer.EndTime)
+                                    if ($pollEnd -gt (Get-Date)) {
+                                        $currentTimer = $pollTimer
+                                        $endTime = $pollEnd
+                                        $foundNextRun = $true
+                                        break
+                                    }
+                                }
+                            }
+                            if ($foundNextRun) { continue }
+                            Write-TimerWatchCompletedScreen -Colors $c -CurrentTimer $currentTimer -Timer $Timer -TotalSeconds $totalSeconds -EndTime $endTime
                             break
                         }
                     }
                 }
-                if ($foundNextRun) { continue }
-                Write-TimerWatchCompletedScreen -Colors $c -CurrentTimer $currentTimer -Timer $Timer -TotalSeconds $totalSeconds -EndTime $endTime
-                break
             }
 
-            $endsAtStr = $endTime.ToString('HH:mm:ss')
-            $sb = Get-TimerWatchRunningContent -Colors $c -CurrentTimer $currentTimer -Timer $Timer -Percent $percent -Remaining $remaining -EndsAtFormatted $endsAtStr
-            $phaseSb = Get-TimerWatchPhaseTimelineContent -Colors $c -CurrentTimer $currentTimer
-            if ($phaseSb) {
-                [void]$sb.Append($phaseSb.ToString())
-            }
+            $endsAtStr = $displayEndTime.ToString('HH:mm:ss')
+            $stateSuffix = if ($currentTimer.State -eq 'Paused') { ' (paused)' } else { '' }
+            $sb = Get-TimerWatchRunningContent -Colors $c -CurrentTimer $displayTimer -Timer $Timer -Percent $percent -Remaining $remaining -EndsAtFormatted $endsAtStr
+            $phaseSb = Get-TimerWatchPhaseTimelineContent -Colors $c -CurrentTimer $displayTimer
+            if ($phaseSb) { [void]$sb.Append($phaseSb.ToString()) }
             [void]$sb.AppendLine("")
-            [void]$sb.AppendLine("$($c.Dim)  Press any key to exit watch mode...$($c.Reset)")
+            [void]$sb.AppendLine((Get-TimerWatchFooterText -Colors $c -ShowHelp:$showHelp) + $stateSuffix)
             Clear-Host
             [Console]::Write($sb.ToString())
-            if (Wait-OneSecondOrKeyPress -Stopwatch $sw) {
-                Write-Host ""
-                return
+
+            $input = Wait-TimerWatchInput -Stopwatch $sw
+            switch ($input.Action) {
+                'exit' { return }
+                'toggleHelp' { $showHelp = -not $showHelp; continue }
+                'togglePause' {
+                    $timers = @(Get-TimerData)
+                    if ($currentTimer.State -eq 'Paused') {
+                        $result = Invoke-ResumeSingleTimer -Timers $timers -Id $watchId
+                        if ($result.CanResume -and $result.NewEndTime) {
+                            $endTime = $result.NewEndTime
+                        }
+                    }
+                    else {
+                        Invoke-PauseSingleTimer -Timers $timers -Id $watchId | Out-Null
+                    }
+                    continue
+                }
+                'prevTimer' {
+                    $watchId = Switch-TimerWatchTarget -ActiveTimers $activeTimers -CurrentId $watchId -Direction 'up'
+                    $Timer = @($allTimers | Where-Object { [string]$_.Id -eq $watchId })[0]
+                    $currentTimer = $Timer
+                    if ($currentTimer.EndTime) { $endTime = [DateTime]::Parse($currentTimer.EndTime) }
+                    continue
+                }
+                'nextTimer' {
+                    $watchId = Switch-TimerWatchTarget -ActiveTimers $activeTimers -CurrentId $watchId -Direction 'down'
+                    $Timer = @($allTimers | Where-Object { [string]$_.Id -eq $watchId })[0]
+                    $currentTimer = $Timer
+                    if ($currentTimer.EndTime) { $endTime = [DateTime]::Parse($currentTimer.EndTime) }
+                    continue
+                }
+                'nextPhase' {
+                    if ($currentTimer.IsSequence) {
+                        if (Invoke-TimerSequencePhaseJump -TimerId $watchId -Direction 'next') {
+                            $refreshed = @((Get-TimerData) | Where-Object { [string]$_.Id -eq $watchId })[0]
+                            if ($refreshed) {
+                                $currentTimer = $refreshed
+                                $endTime = [DateTime]::Parse($refreshed.EndTime)
+                            }
+                        }
+                    }
+                    continue
+                }
+                'prevPhase' {
+                    if ($currentTimer.IsSequence) {
+                        if (Invoke-TimerSequencePhaseJump -TimerId $watchId -Direction 'prevOrRestart') {
+                            $refreshed = @((Get-TimerData) | Where-Object { [string]$_.Id -eq $watchId })[0]
+                            if ($refreshed) {
+                                $currentTimer = $refreshed
+                                $endTime = [DateTime]::Parse($refreshed.EndTime)
+                            }
+                        }
+                    }
+                    continue
+                }
+                default { continue }
             }
         }
     }
@@ -3889,6 +5870,7 @@ function Timer-Resume {
             Write-Host "[$Id]" -ForegroundColor Cyan -NoNewline
             Write-Host " $action. " -ForegroundColor Green -NoNewline
             Write-Host "Ends at $($result.NewEndTime.ToString('HH:mm:ss'))`n" -ForegroundColor Yellow
+            Invoke-TimerAfterStart -TimerId $Id
         }
     }
 }
@@ -4073,5 +6055,6 @@ Set-Alias -Name tr -Value Timer-Resume -Scope Global
 Set-Alias -Name td -Value Timer-Remove -Scope Global
 Set-Alias -Name tpre -Value Timer-Presets -Scope Global
 Set-Alias -Name ts -Value Timer-Stats -Scope Global
+Set-Alias -Name twko -Value Timer-Workout -Scope Global
 # endregion Timer-Aliases.ps1
 

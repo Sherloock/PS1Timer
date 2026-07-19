@@ -15,9 +15,11 @@
         'Get-TimerDataIfChanged', 'Get-TimerForWatch', 'Get-TimerHistory', 'Get-TimerListRowColorsForState',
         'Get-TimerListRowDisplayData', 'Get-TimerListWatchRowLine', 'Get-TimerNotificationConfig',
         'Get-TimerNotificationType', 'Get-TimerPickerOptions', 'Get-TimerProgress', 'Get-TimerStatsSummary',
-        'Parse-TimerAtTime', 'Resolve-TimerNotificationSettings', 'Resolve-TimerSoundFilePath', 'Resolve-TimerWebhookUrl',
+        'Parse-TimerAtTime', 'Parse-BeepAtList', 'Resolve-TimerNotificationSettings', 'Resolve-TimerSoundFilePath', 'Resolve-TimerWebhookUrl',
         'Get-TimerResumeSeconds', 'Get-TimerStateColor', 'Get-TimerTaskName', 'Get-TimerWatchCompletedContent',
-        'Get-TimerWatchPhaseTimelineContent', 'Get-TimerWatchRunningContent', 'Get-TruncatedMessage',
+        'Get-TimerWatchNotifyLabel', 'Get-TimerWatchPhaseTimelineContent', 'Get-TimerWatchRunningContent', 'Get-TruncatedMessage',
+        'Get-TimerInstalledVoices', 'Get-TimerPhaseCueSchedule', 'Get-WorkoutPickerOptions', 'ConvertFrom-WorkoutRoutine',
+        'Resolve-TimerSpeechText', 'Invoke-TimerSpeech',
         'Invoke-PauseSingleTimer', 'Invoke-PauseTimersBulk', 'Invoke-RemoveSingleTimer',
         'Invoke-RemoveTimersBulk', 'Invoke-ResumeSingleTimer', 'Invoke-ResumeTimersBulk',
         'New-SequenceTimerFromPhases', 'New-TimerId', 'New-TimerTaskName', 'ParseSequence',
@@ -25,13 +27,13 @@
         'Show-TimerListWatch', 'Show-TimerNotification', 'Show-TimerNotificationHelp', 'Show-TimerPopup',
         'Show-TimerToast', 'Show-TimerWatchDisplay', 'Start-SequenceTimer', 'Start-SequenceTimerJob',
         'Start-TimerJob', 'Start-TimerScheduledJob', 'Stop-TimerTask', 'Sync-TimerData', 'Test-TimerIsActiveDisplay',
-        'Test-TimerSequence', 'Timer', 'Timer-List', 'Timer-Pause', 'Timer-Presets', 'Timer-Remove',
-        'Timer-Resume', 'Timer-Stats', 'Timer-Watch', 'TimerList', 'TimerPause', 'TimerPresets', 'TimerRemove',
+        'Test-TimerSequence',         'Timer', 'Timer-List', 'Timer-Pause', 'Timer-Presets', 'Timer-Remove',
+        'Timer-Resume', 'Timer-Stats', 'Timer-Watch', 'Timer-Workout', 'TimerList', 'TimerPause', 'TimerPresets', 'TimerRemove',
         'TimerResume', 'TimerStats', 'TimerWatch', 'Wait-OneSecondOrKeyPress', 'Write-HelpMenu',
         'Write-SequenceTimerConfirmation'
     )
 
     CmdletsToExport    = @()
     VariablesToExport  = @()
-    AliasesToExport    = @('t', 'td', 'tl', 'tp', 'tpre', 'tr', 'ts', 'tw')
+    AliasesToExport    = @('t', 'td', 'tl', 'tp', 'tpre', 'tr', 'ts', 'tw', 'twko')
 }
