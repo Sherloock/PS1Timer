@@ -425,6 +425,16 @@ $script:PS1TimerModuleConfig = @{
     VoiceTemplates  = $null
     Workouts        = $null
 }
+# Resolved ANSI palette cache — watch loops resolve colors every second per row
+$script:TimerAnsiColorsCache = $null
+$script:TimerAnsiColorsCacheTheme = $null
+$script:TimerAnsiColorsCachePalettes = $null
+
+function Clear-TimerAnsiColorsCache {
+    $script:TimerAnsiColorsCache = $null
+    $script:TimerAnsiColorsCacheTheme = $null
+    $script:TimerAnsiColorsCachePalettes = $null
+}
 
 function Initialize-PS1TimerModuleConfig {
     <#
@@ -439,6 +449,7 @@ function Initialize-PS1TimerModuleConfig {
         VoiceTemplates = $null
         Workouts       = $null
     }
+    Clear-TimerAnsiColorsCache
 
     if (-not $global:Config) { return }
 
@@ -614,19 +625,20 @@ function Get-TimerNotifyChannelsFromTimer {
     param([PSCustomObject]$Timer)
 
     $defaults = Get-TimerModuleNotifyFallback
+    $props = $Timer.PSObject.Properties
 
-    if ($Timer.PSObject.Properties.Name -contains 'NotifyVisual') {
+    if ($null -ne $props['NotifyVisual']) {
         $visual = if (-not [string]::IsNullOrWhiteSpace([string]$Timer.NotifyVisual)) {
             "$($Timer.NotifyVisual)".ToLower()
         } else {
             $defaults.Visual
         }
-        $sound = if ($Timer.PSObject.Properties.Name -contains 'NotifySound') { [bool]$Timer.NotifySound } else { $defaults.Sound }
-        $voice = if ($Timer.PSObject.Properties.Name -contains 'NotifyVoice') { [bool]$Timer.NotifyVoice } else { $defaults.Voice }
+        $sound = if ($null -ne $props['NotifySound']) { [bool]$Timer.NotifySound } else { $defaults.Sound }
+        $voice = if ($null -ne $props['NotifyVoice']) { [bool]$Timer.NotifyVoice } else { $defaults.Voice }
         return @{ Visual = $visual; Sound = $sound; Voice = $voice }
     }
 
-    if ($Timer.PSObject.Properties.Name -contains 'NotifyType' -and $Timer.NotifyType) {
+    if ($null -ne $props['NotifyType'] -and $Timer.NotifyType) {
         $legacy = ConvertFrom-LegacyNotifyMode -Notify $Timer.NotifyType
         return @{ Visual = $legacy.Visual; Sound = $legacy.Sound; Voice = $false }
     }
@@ -1200,18 +1212,18 @@ function Get-WorkoutPickerOptions {
     $workouts = Get-PS1TimerModuleWorkouts
     if (-not $workouts -or $workouts.Count -eq 0) { return @() }
 
-    $options = @()
+    $options = [System.Collections.Generic.List[object]]::new()
     foreach ($key in ($workouts.Keys | Sort-Object)) {
         $w = $workouts[$key]
         $desc = if ($w.Description) { [string]$w.Description } else { $key }
-        $options += @{
+        $options.Add(@{
             Id          = $key
             Label       = $key
             Description = $desc
             Color       = 'Cyan'
-        }
+        })
     }
-    return $options
+    return $options.ToArray()
 }
 
 function Parse-TimerAtTime {

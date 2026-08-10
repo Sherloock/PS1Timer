@@ -19,7 +19,8 @@ $script:TimerTaskNameCache = $null
 $script:TimerTaskNameCacheTime = [DateTime]::MinValue
 $script:TimerTaskNameCacheTtlSeconds = 2
 $script:TimerStaleCleanupLastRun = [DateTime]::MinValue
-$script:TimerStaleCleanupIntervalSeconds = 5
+# Stale cleanup forces a full Task Scheduler enumeration; keep it rare — watch mode syncs every second
+$script:TimerStaleCleanupIntervalSeconds = 30
 $script:TimerDataMutexName = 'Global\PS1Timer_ps-timers_json'
 $script:TimerDataFileLockTimeoutMs = 8000
 $script:TimerDataFileIoRetryCount = 8
@@ -388,7 +389,8 @@ function Save-TimerData {
     $clean = [System.Collections.Generic.List[object]]::new()
     foreach ($t in $Timers) {
         if ($null -ne $t -and $null -ne $t.PSObject.Properties['Id']) {
-            $obj = [PSCustomObject]@{
+            $props = $t.PSObject.Properties
+            $obj = [ordered]@{
                 Id               = $t.Id
                 Duration         = $t.Duration
                 Seconds          = [int]$t.Seconds
@@ -405,56 +407,56 @@ function Save-TimerData {
             }
 
             # Add sequence-specific fields if present
-            if ($t.PSObject.Properties.Name -contains 'NotifyVisual') {
-                $obj | Add-Member -NotePropertyName 'NotifyVisual' -NotePropertyValue ([string]$t.NotifyVisual)
+            if ($null -ne $props['NotifyVisual']) {
+                $obj['NotifyVisual'] = [string]$t.NotifyVisual
             }
-            if ($t.PSObject.Properties.Name -contains 'NotifySound') {
-                $obj | Add-Member -NotePropertyName 'NotifySound' -NotePropertyValue ([bool]$t.NotifySound)
+            if ($null -ne $props['NotifySound']) {
+                $obj['NotifySound'] = [bool]$t.NotifySound
             }
-            if ($t.PSObject.Properties.Name -contains 'NotifyVoice') {
-                $obj | Add-Member -NotePropertyName 'NotifyVoice' -NotePropertyValue ([bool]$t.NotifyVoice)
+            if ($null -ne $props['NotifyVoice']) {
+                $obj['NotifyVoice'] = [bool]$t.NotifyVoice
             }
-            if ($t.PSObject.Properties.Name -contains 'NotifyType' -and $t.NotifyType) {
-                $obj | Add-Member -NotePropertyName 'NotifyType' -NotePropertyValue $t.NotifyType
+            if ($null -ne $props['NotifyType'] -and $t.NotifyType) {
+                $obj['NotifyType'] = $t.NotifyType
             }
-            if ($t.PSObject.Properties.Name -contains 'WebhookName' -and $t.WebhookName) {
-                $obj | Add-Member -NotePropertyName 'WebhookName' -NotePropertyValue $t.WebhookName
+            if ($null -ne $props['WebhookName'] -and $t.WebhookName) {
+                $obj['WebhookName'] = $t.WebhookName
             }
-            if ($t.PSObject.Properties.Name -contains 'VoiceName' -and $t.VoiceName) {
-                $obj | Add-Member -NotePropertyName 'VoiceName' -NotePropertyValue $t.VoiceName
+            if ($null -ne $props['VoiceName'] -and $t.VoiceName) {
+                $obj['VoiceName'] = $t.VoiceName
             }
-            if ($t.PSObject.Properties.Name -contains 'VoiceRate') {
-                $obj | Add-Member -NotePropertyName 'VoiceRate' -NotePropertyValue ([int]$t.VoiceRate)
+            if ($null -ne $props['VoiceRate']) {
+                $obj['VoiceRate'] = [int]$t.VoiceRate
             }
-            if ($t.PSObject.Properties.Name -contains 'VoiceVolume') {
-                $obj | Add-Member -NotePropertyName 'VoiceVolume' -NotePropertyValue ([int]$t.VoiceVolume)
+            if ($null -ne $props['VoiceVolume']) {
+                $obj['VoiceVolume'] = [int]$t.VoiceVolume
             }
-            if ($t.PSObject.Properties.Name -contains 'CountdownMode' -and $t.CountdownMode) {
-                $obj | Add-Member -NotePropertyName 'CountdownMode' -NotePropertyValue $t.CountdownMode
+            if ($null -ne $props['CountdownMode'] -and $t.CountdownMode) {
+                $obj['CountdownMode'] = $t.CountdownMode
             }
-            if ($t.PSObject.Properties.Name -contains 'CueTaskNames' -and $t.CueTaskNames) {
-                $obj | Add-Member -NotePropertyName 'CueTaskNames' -NotePropertyValue @($t.CueTaskNames)
+            if ($null -ne $props['CueTaskNames'] -and $t.CueTaskNames) {
+                $obj['CueTaskNames'] = @($t.CueTaskNames)
             }
-            if ($t.PSObject.Properties.Name -contains 'BeepAt' -and $t.BeepAt) {
-                $obj | Add-Member -NotePropertyName 'BeepAt' -NotePropertyValue @($t.BeepAt | ForEach-Object { [int]$_ })
+            if ($null -ne $props['BeepAt'] -and $t.BeepAt) {
+                $obj['BeepAt'] = @(foreach ($b in $t.BeepAt) { [int]$b })
             }
-            if ($t.PSObject.Properties.Name -contains 'IsWorkout') {
-                $obj | Add-Member -NotePropertyName 'IsWorkout' -NotePropertyValue ([bool]$t.IsWorkout)
+            if ($null -ne $props['IsWorkout']) {
+                $obj['IsWorkout'] = [bool]$t.IsWorkout
             }
-            if ($t.PSObject.Properties.Name -contains 'WorkoutRoutine' -and $t.WorkoutRoutine) {
-                $obj | Add-Member -NotePropertyName 'WorkoutRoutine' -NotePropertyValue $t.WorkoutRoutine
+            if ($null -ne $props['WorkoutRoutine'] -and $t.WorkoutRoutine) {
+                $obj['WorkoutRoutine'] = $t.WorkoutRoutine
             }
 
             if ($t.IsSequence) {
-                $obj | Add-Member -NotePropertyName 'SequencePattern' -NotePropertyValue $t.SequencePattern
-                $obj | Add-Member -NotePropertyName 'Phases' -NotePropertyValue $t.Phases
-                $obj | Add-Member -NotePropertyName 'CurrentPhase' -NotePropertyValue ([int]$t.CurrentPhase)
-                $obj | Add-Member -NotePropertyName 'TotalPhases' -NotePropertyValue ([int]$t.TotalPhases)
-                $obj | Add-Member -NotePropertyName 'PhaseLabel' -NotePropertyValue $t.PhaseLabel
-                $obj | Add-Member -NotePropertyName 'TotalSeconds' -NotePropertyValue ([int]$t.TotalSeconds)
+                $obj['SequencePattern'] = $t.SequencePattern
+                $obj['Phases'] = $t.Phases
+                $obj['CurrentPhase'] = [int]$t.CurrentPhase
+                $obj['TotalPhases'] = [int]$t.TotalPhases
+                $obj['PhaseLabel'] = $t.PhaseLabel
+                $obj['TotalSeconds'] = [int]$t.TotalSeconds
             }
 
-            $clean.Add($obj)
+            $clean.Add([PSCustomObject]$obj)
         }
     }
 
@@ -952,7 +954,7 @@ function Get-TimerPickerOptions {
         [string]$AllOptionColor = 'Yellow'
     )
 
-    $options = @()
+    $options = [System.Collections.Generic.List[object]]::new()
 
     # Filter timers if state specified
     $filteredTimers = $Timers
@@ -984,36 +986,36 @@ function Get-TimerPickerOptions {
             $label = "[$($t.Id)] $($t.Message) ($($t.State))"
         }
 
-        $options += @{
+        $options.Add(@{
             Id    = $t.Id
             Label = $label
             Color = $color
-        }
+        })
     }
 
     # Add "done" option if requested
     if ($IncludeDoneOption) {
         $doneCount = @($Timers | Where-Object { $_.State -eq 'Completed' -or $_.State -eq 'Lost' }).Count
         if ($doneCount -gt 0) {
-            $options += @{
+            $options.Add(@{
                 Id    = 'done'
                 Label = "Remove all finished ($doneCount completed/lost)"
                 Color = 'Cyan'
-            }
+            })
         }
     }
 
     # Add "all" option if requested and multiple timers exist
     if ($IncludeAllOption -and $filteredTimers.Count -gt 1) {
         $label = if ($AllOptionLabel) { $AllOptionLabel } else { "All ($($filteredTimers.Count) total)" }
-        $options += @{
+        $options.Add(@{
             Id    = 'all'
             Label = $label
             Color = $AllOptionColor
-        }
+        })
     }
 
-    return $options
+    return $options.ToArray()
 }
 # endregion Timer-Data.ps1
 
@@ -1024,6 +1026,9 @@ function Get-AnsiColors {
     <#
     .SYNOPSIS
         Returns a hashtable of ANSI color escape codes for console output.
+    .DESCRIPTION
+        Resolved palettes are cached: watch loops resolve colors every second per row.
+        Cache is keyed on theme + palettes source; Initialize-PS1TimerModuleConfig clears it.
     #>
     $esc = [char]27
     $theme = 'default'
@@ -1032,7 +1037,14 @@ function Get-AnsiColors {
         $theme = $timerDefaults.Theme.ToLower()
     }
 
-    $palettes = Get-PS1TimerModulePalettes
+    $paletteSource = Get-PS1TimerModulePalettes
+    if ($null -ne $script:TimerAnsiColorsCache -and
+        $script:TimerAnsiColorsCacheTheme -eq $theme -and
+        [object]::ReferenceEquals($script:TimerAnsiColorsCachePalettes, $paletteSource)) {
+        return $script:TimerAnsiColorsCache
+    }
+
+    $palettes = $paletteSource
     if (-not $palettes) {
         $palettes = Get-DefaultTimerPalettes
     }
@@ -1042,7 +1054,7 @@ function Get-AnsiColors {
         $paletteEntry = (Get-DefaultTimerPalettes)['default']
     }
     $palette = Resolve-TimerPaletteColors -PaletteEntry $paletteEntry
-    return @{
+    $result = @{
         Esc          = $esc
         Reset        = "$esc[0m"
         Bold         = "$esc[1m"
@@ -1058,6 +1070,11 @@ function Get-AnsiColors {
         Selected     = $palette.Selected
         Theme        = $theme
     }
+
+    $script:TimerAnsiColorsCache = $result
+    $script:TimerAnsiColorsCacheTheme = $theme
+    $script:TimerAnsiColorsCachePalettes = $paletteSource
+    return $result
 }
 
 function Format-RemainingTime {
@@ -1606,9 +1623,10 @@ function Get-TimerWatchNotifyLabel {
     param([PSCustomObject]$Timer)
 
     $channels = Get-TimerNotifyChannelsFromTimer -Timer $Timer
-    $webhookName = if ($Timer.PSObject.Properties.Name -contains 'WebhookName') { $Timer.WebhookName } else { $null }
+    $props = $Timer.PSObject.Properties
+    $webhookName = if ($null -ne $props['WebhookName']) { $Timer.WebhookName } else { $null }
     $voice = if ($channels.Voice) { $true } else { $false }
-    return Format-TimerNotifyLabel -Visual $channels.Visual -Sound $channels.Sound -WebhookName $webhookName -Voice $voice -CountdownMode $(if ($Timer.PSObject.Properties.Name -contains 'CountdownMode') { $Timer.CountdownMode } else { $null })
+    return Format-TimerNotifyLabel -Visual $channels.Visual -Sound $channels.Sound -WebhookName $webhookName -Voice $voice -CountdownMode $(if ($null -ne $props['CountdownMode']) { $Timer.CountdownMode } else { $null })
 }
 
 function Get-TimerWatchCompletedContent {
@@ -5357,8 +5375,12 @@ function Show-TimerListWatch {
                 }
             }
 
-            $running = @($displayTimers | Where-Object { $_.State -eq 'Running' }).Count
-            $paused = @($displayTimers | Where-Object { $_.State -eq 'Paused' }).Count
+            $running = 0
+            $paused = 0
+            foreach ($t in $displayTimers) {
+                if ($t.State -eq 'Running') { $running++ }
+                elseif ($t.State -eq 'Paused') { $paused++ }
+            }
 
             [void]$sb.AppendLine("")
             $pausedPart = if ($paused -gt 0) { "$($c.Warning), $paused paused$($c.Reset)" } else { "" }
@@ -5393,25 +5415,25 @@ function Timer-Presets {
     .SYNOPSIS
         Shows interactive preset picker for common timer sequences.
     #>
-    $options = @()
+    $options = [System.Collections.Generic.List[object]]::new()
     foreach ($name in $script:TimerPresets.Keys | Sort-Object) {
         $preset = $script:TimerPresets[$name]
         $phases = ConvertFrom-TimerSequence -Pattern $preset.Pattern
         $summary = Get-SequenceSummary -Phases $phases
 
-        $options += @{
+        $options.Add(@{
             Id          = $name
             Label       = "$name - $($summary.TotalDuration) total ($($summary.PhaseCount) phases)"
             Description = $preset.Description
             Color       = 'White'
-        }
+        })
     }
 
-    $options += @{
+    $options.Add(@{
         Id    = '_custom'
         Label = "[Enter custom sequence...]"
         Color = 'Cyan'
-    }
+    })
 
     $selectedId = Show-MenuPicker -Title "SELECT TIMER PRESET" -Options $options -AllowCancel
 
@@ -5593,7 +5615,7 @@ function Show-TimerWatchDisplay {
             $activeTimers = Get-TimerWatchActiveTimers -Timers $allTimers
             $cacheResult = Get-TimerDataIfChanged
             if ($cacheResult.Changed) {
-                $currentTimer = @($cacheResult.Data | Where-Object { [string]$_.Id -eq $watchId })[0]
+                $currentTimer = Find-TimerById -Timers @($cacheResult.Data) -Id $watchId
                 if ($currentTimer -and $currentTimer.EndTime) {
                     $endTime = [DateTime]::Parse($currentTimer.EndTime)
                 }
@@ -5636,7 +5658,7 @@ function Show-TimerWatchDisplay {
                     }
 
                     $refresh = Get-TimerDataIfChanged -Force
-                    $refreshed = @($refresh.Data | Where-Object { [string]$_.Id -eq $watchId })[0]
+                    $refreshed = Find-TimerById -Timers @($refresh.Data) -Id $watchId
                     if ($refreshed) {
                         if ($refreshed.State -eq 'Completed') {
                             Write-TimerWatchCompletedScreen -Colors $c -CurrentTimer $refreshed -Timer $Timer -TotalSeconds $totalSeconds -EndTime $endTime
@@ -5673,7 +5695,7 @@ function Show-TimerWatchDisplay {
                             foreach ($delay in $pollMs) {
                                 Start-Sleep -Milliseconds $delay
                                 $pollRefresh = Get-TimerDataIfChanged -Force
-                                $pollTimer = @($pollRefresh.Data | Where-Object { [string]$_.Id -eq $watchId })[0]
+                                $pollTimer = Find-TimerById -Timers @($pollRefresh.Data) -Id $watchId
                                 if ($pollTimer -and $pollTimer.State -eq 'Completed') {
                                     Write-TimerWatchCompletedScreen -Colors $c -CurrentTimer $pollTimer -Timer $Timer -TotalSeconds $totalSeconds -EndTime $endTime
                                     return
@@ -5725,14 +5747,14 @@ function Show-TimerWatchDisplay {
                 }
                 'prevTimer' {
                     $watchId = Switch-TimerWatchTarget -ActiveTimers $activeTimers -CurrentId $watchId -Direction 'up'
-                    $Timer = @($allTimers | Where-Object { [string]$_.Id -eq $watchId })[0]
+                    $Timer = Find-TimerById -Timers $allTimers -Id $watchId
                     $currentTimer = $Timer
                     if ($currentTimer.EndTime) { $endTime = [DateTime]::Parse($currentTimer.EndTime) }
                     continue
                 }
                 'nextTimer' {
                     $watchId = Switch-TimerWatchTarget -ActiveTimers $activeTimers -CurrentId $watchId -Direction 'down'
-                    $Timer = @($allTimers | Where-Object { [string]$_.Id -eq $watchId })[0]
+                    $Timer = Find-TimerById -Timers $allTimers -Id $watchId
                     $currentTimer = $Timer
                     if ($currentTimer.EndTime) { $endTime = [DateTime]::Parse($currentTimer.EndTime) }
                     continue
@@ -5740,7 +5762,7 @@ function Show-TimerWatchDisplay {
                 'nextPhase' {
                     if ($currentTimer.IsSequence) {
                         if (Invoke-TimerSequencePhaseJump -TimerId $watchId -Direction 'next') {
-                            $refreshed = @((Get-TimerData) | Where-Object { [string]$_.Id -eq $watchId })[0]
+                            $refreshed = Find-TimerById -Timers @(Get-TimerData) -Id $watchId
                             if ($refreshed) {
                                 $currentTimer = $refreshed
                                 $endTime = [DateTime]::Parse($refreshed.EndTime)
@@ -5752,7 +5774,7 @@ function Show-TimerWatchDisplay {
                 'prevPhase' {
                     if ($currentTimer.IsSequence) {
                         if (Invoke-TimerSequencePhaseJump -TimerId $watchId -Direction 'prevOrRestart') {
-                            $refreshed = @((Get-TimerData) | Where-Object { [string]$_.Id -eq $watchId })[0]
+                            $refreshed = Find-TimerById -Timers @(Get-TimerData) -Id $watchId
                             if ($refreshed) {
                                 $currentTimer = $refreshed
                                 $endTime = [DateTime]::Parse($refreshed.EndTime)
