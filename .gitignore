@@ -5,3 +5,10 @@ TestResults/
 *.user
 Thumbs.db
 .DS_Store
+
+# agent junctions made by glue_me/scripts/link_agent_skills.py --repo (the files live in .agents/)
+.claude/skills
+.claude/commands
+.cursor/skills
+.cursor/commands
+.cursor/rules
